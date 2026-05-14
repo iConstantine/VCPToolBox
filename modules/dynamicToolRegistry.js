@@ -313,10 +313,22 @@ class DynamicToolRegistry {
             }
         }
 
+        // Purge stale distributed entries before the "missing tools" loop.
+        // When a cloud server reconnects it gets a new serverId, producing a new
+        // originKey.  Old catalog entries for the same pluginName (different
+        // originKey) would linger as offline forever.  Remove them proactively.
+        this._purgeStaleDistributedEntries(currentRecords);
+
         for (const [originKey, previous] of this.catalog.entries()) {
             if (seen.has(originKey)) continue;
             const next = { ...previous };
             if (next.originKind === 'distributed') {
+                // When sync is triggered by local plugin reload, cloud tools are
+                // expected to be absent - WebSocket hasn't reconnected yet.
+                // Preserve their current online status instead of forcing offline.
+                if (reason === 'local_reload') {
+                    continue;
+                }
                 next.online = false;
             } else {
                 next.enabled = false;
@@ -334,7 +346,49 @@ class DynamicToolRegistry {
         this._scheduleClassificationFlush();
     }
 
+    _purgeStaleDistributedEntries(currentRecords) {
+        // Build a map: pluginName -> Set of originKeys that are current & online
+        const activeDistributed = new Map();
+        for (const record of currentRecords) {
+            if (record.originKind !== 'distributed') continue;
+            if (!record.pluginName) continue;
+            let keys = activeDistributed.get(record.pluginName);
+            if (!keys) {
+                keys = new Set();
+                activeDistributed.set(record.pluginName, keys);
+            }
+            keys.add(record.originKey);
+        }
+
+        if (activeDistributed.size === 0) return;
+
+        const keysToRemove = [];
+        for (const [originKey, entry] of this.catalog.entries()) {
+            if (entry.originKind !== 'distributed') continue;
+            const activeKeys = activeDistributed.get(entry.pluginName);
+            if (!activeKeys) continue; // no current record for this pluginName
+            // If this entry's originKey is not among the active ones, it's stale
+            if (!activeKeys.has(originKey)) {
+                keysToRemove.push(originKey);
+            }
+        }
+
+        for (const key of keysToRemove) {
+            this.catalog.delete(key);
+            this.categories.delete(key);
+        }
+    }
+
     async markDistributedOffline(serverId, manifests = []) {
+        this.syncPromise = this.syncPromise
+            .catch((error) => {
+                this.lastError = error.message;
+            })
+            .then(() => this._markDistributedOffline(serverId, manifests));
+        return this.syncPromise;
+    }
+
+    async _markDistributedOffline(serverId, manifests = []) {
         if (!serverId) return;
         const now = new Date().toISOString();
         let changed = false;
