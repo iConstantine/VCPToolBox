@@ -15,6 +15,16 @@
     "timeout": 180000
   },
   "configSchema": {
+    "DIGITAL_ORACLE_PROXY_PORT": {
+      "type": "string",
+      "description": "本地 HTTP/S 代理端口，留空则不启用。例如: 7890",
+      "default": "7890"
+    },
+    "DIGITAL_ORACLE_PROXY_URL": {
+      "type": "string",
+      "description": "完整的 HTTP/S 代理 URL，例如: http://127.0.0.1:7890。留空则优先使用 PORT 参数。",
+      "default": ""
+    },
     "DIGITAL_ORACLE_SEC_EMAIL": {
       "type": "string",
       "description": "SEC EDGAR 信源所需邮箱，会作为 User-Agent 身份的一部分发送；仅在调用 edgar 信源时必需。",
