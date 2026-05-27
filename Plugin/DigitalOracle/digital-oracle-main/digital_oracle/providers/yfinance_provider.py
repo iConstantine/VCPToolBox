@@ -315,6 +315,14 @@ class _YFinanceFetcher:
 
         self._yf = yfinance
 
+        # Configure proxy globally if set in environment variables
+        proxy_url = os.environ.get("DIGITAL_ORACLE_PROXY_URL") or os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("http_proxy") or os.environ.get("https_proxy")
+        if proxy_url:
+            try:
+                self._yf.config.network.proxy = {"http": proxy_url, "https": proxy_url}
+            except Exception:
+                pass
+
     def fetch_expirations(self, ticker: str) -> tuple[str, ...]:
         t = self._yf.Ticker(ticker)
         return tuple(t.options)

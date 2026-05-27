@@ -158,7 +158,18 @@ tag-processor-config.env
 *.sqlite-shm
 *.sqlite-wal
 *.db
+*.db-shm
+*.db-wal
 DebugLog/
+
+# Python 编译缓存
+__pycache__/
+
+# Agent 临时产生的文件
+research/
+backup_before_pull_temp/
+backup_before_rebase_manual/
+sarprompt.json
 dailynote/*
 !dailynote/VCP桌面知识/
 ip_blacklist.json
@@ -229,3 +240,10 @@ Plugin/XiaohongshuFetch/config.env
 pluginStoreSources.json
 tmp/
 Plugin/.backup/
+
+# ==== Agent 提示词（个人定制，不跟踪） ====
+Agent/*.txt
+
+# Ignored plugins
+Plugin/DigitalOracle/
+Plugin/TavilySearch/

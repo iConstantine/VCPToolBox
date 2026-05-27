@@ -15,16 +15,6 @@ const crypto = require('crypto');
 const path = require('path');
 const { getSSHManager, resetSSHManager } = require('../../modules/SSHManager');
 
-const DEFAULT_HOSTS_TEMPLATE_MD5 = 'b1d6472eba3a65b9354a096ce21d3f3e';
-const HOSTS_CONFIG_PATH = path.join(
-    __dirname,
-    '..',
-    '..',
-    'Plugin',
-    'LinuxShellExecutor',
-    'hosts.json'
-);
-
 function createIpcPath(prefix) {
     if (process.platform === 'win32') {
         return `\\\\.\\pipe\\${prefix}-${process.pid}`;
@@ -32,34 +22,27 @@ function createIpcPath(prefix) {
     return `/tmp/${prefix}-${process.pid}.sock`;
 }
 
-function calculateHostsConfigMd5() {
-    try {
-        return crypto
-            .createHash('md5')
-            .update(fs.readFileSync(HOSTS_CONFIG_PATH))
-            .digest('hex');
-    } catch (e) {
-        return null;
-    }
-}
-
-function isDefaultHostsTemplate() {
-    return calculateHostsConfigMd5() === DEFAULT_HOSTS_TEMPLATE_MD5;
-}
-
 /**
  * 加载主机配置文件
  * @returns {Object} 主机配置对象
  */
 function loadHostsConfig() {
+    const configPath = path.join(
+        __dirname,
+        '..',
+        '..',
+        'Plugin',
+        'LinuxShellExecutor',
+        'hosts.json'
+    );
     try {
-        if (fs.existsSync(HOSTS_CONFIG_PATH)) {
-            delete require.cache[require.resolve(HOSTS_CONFIG_PATH)];
-            return require(HOSTS_CONFIG_PATH);
+        if (fs.existsSync(configPath)) {
+            delete require.cache[require.resolve(configPath)];
+            return require(configPath);
         }
     } catch (e) {
         console.error(
-            `[SSHManagerService] 无法加载主机配置: ${HOSTS_CONFIG_PATH}: ${e.message}`
+            `[SSHManagerService] 无法加载主机配置: ${configPath}: ${e.message}`
         );
     }
     return { hosts: {}, globalSettings: {} };
@@ -105,16 +88,7 @@ class SSHManagerService {
         if (this.server || this.sshManager || this.clients.size > 0 || this.streamSessions.size > 0) {
             await this.shutdown();
         }
-        this._clearGlobalIpcState({ force: true });
         this.authToken = crypto.randomBytes(32).toString('hex');
-
-        if (isDefaultHostsTemplate()) {
-            console.log(
-                `[SSHManagerService] ${HOSTS_CONFIG_PATH} 仍为默认模板 (MD5=${DEFAULT_HOSTS_TEMPLATE_MD5})，SSH 常驻服务不启动`
-            );
-            this._clearGlobalIpcState({ force: true });
-            return;
-        }
 
         // 加载 hosts.json
         const hostsConfig = loadHostsConfig();
@@ -130,7 +104,6 @@ class SSHManagerService {
             console.log(
                 '[SSHManagerService] 未检测到有效的 SSH 资产，服务静默跳过初始化'
             );
-            this._clearGlobalIpcState({ force: true });
             return;
         }
 
@@ -138,7 +111,6 @@ class SSHManagerService {
         this.sshManager = getSSHManager(hostsConfig, { basePath: __dirname });
         if (!this.sshManager) {
             console.error('[SSHManagerService] 创建 SSHManager 实例失败');
-            this._clearGlobalIpcState({ force: true });
             return;
         }
 
@@ -206,15 +178,6 @@ class SSHManagerService {
             try {
                 fs.unlinkSync(this.sockPath);
             } catch (e) {}
-        }
-    }
-
-    _clearGlobalIpcState({ force = false } = {}) {
-        if (force || global.__vcp_ssh_manager_sock === this.sockPath) {
-            delete global.__vcp_ssh_manager_sock;
-        }
-        if (force || global.__vcp_ssh_manager_token === this.authToken) {
-            delete global.__vcp_ssh_manager_token;
         }
     }
 
@@ -585,7 +548,12 @@ class SSHManagerService {
             }
             this.sshManager = null;
         }
-        this._clearGlobalIpcState();
+        if (global.__vcp_ssh_manager_sock === this.sockPath) {
+            delete global.__vcp_ssh_manager_sock;
+        }
+        if (global.__vcp_ssh_manager_token === this.authToken) {
+            delete global.__vcp_ssh_manager_token;
+        }
         console.log('[SSHManagerService] 已关闭');
     }
 
@@ -610,7 +578,12 @@ class SSHManagerService {
 
         await this._closeServer();
         await this._resetSSHManager();
-        this._clearGlobalIpcState();
+        if (global.__vcp_ssh_manager_sock === this.sockPath) {
+            delete global.__vcp_ssh_manager_sock;
+        }
+        if (global.__vcp_ssh_manager_token === this.authToken) {
+            delete global.__vcp_ssh_manager_token;
+        }
         console.log('[SSHManagerService] 已关闭');
     }
 }

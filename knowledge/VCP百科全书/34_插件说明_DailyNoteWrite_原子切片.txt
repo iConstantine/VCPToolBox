@@ -1,4 +1,4 @@
-[2026-03-03] - Codex
+﻿[2026-03-03] - Codex
 [VCP百科全书] 插件说明——DailyNoteWrite（原子切片）
 
 一、插件身份
@@ -30,7 +30,7 @@
 <<<[TOOL_REQUEST]>>>
 tool_name:「始」DailyNoteWrite「末」,
 title:「始」VCP开发复盘_标签规范「末」,
-content:「始」今天统一了插件切片Tag格式，提升了召回稳定性。Tag: 标签规范, 切片治理, RAG优化「末」
+content:「始」今天统一了插件切片Tag格式，提升了召回稳定性。\nTag: 标签规范, 切片治理, RAG优化「末」
 <<<[END_TOOL_REQUEST]>>>
 
 Tag: DailyNoteWrite, 日记写入, Tag标准化, Tag自动修复, Tag生成, TagMaster, RAG召回, 词元规范, 同步插件

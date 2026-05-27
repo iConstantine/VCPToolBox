@@ -8,15 +8,6 @@ from typing import Any
 from urllib.parse import urlparse
 import re
 
-# Try to load local config.env if python-dotenv is installed
-try:
-    from dotenv import load_dotenv
-    _env_path = Path(__file__).resolve().parent / "config.env"
-    if _env_path.exists():
-        load_dotenv(dotenv_path=_env_path)
-except ImportError:
-    pass
-
 
 CURRENT_DIR = Path(__file__).resolve().parent
 UPSTREAM_ROOT = CURRENT_DIR / "digital-oracle-main"

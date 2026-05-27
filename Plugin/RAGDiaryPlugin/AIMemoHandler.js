@@ -24,14 +24,10 @@ class AIMemoHandler {
 
     async loadConfig() {
         // 从环境变量加载配置
-        // 🐛 Bug Fix: 规范化 URL，确保末尾有 '/'，防止拼接时产生 "http://hostv1/..." 的无效 URL
-        const rawUrl = process.env.AIMemoUrl || '';
-        const normalizedUrl = rawUrl ? rawUrl.replace(/\/+$/, '') + '/' : '';
-
         this.config = {
             model: process.env.AIMemoModel || '',
             batchSize: parseInt(process.env.AIMemoBatch) || 5,
-            url: normalizedUrl,
+            url: process.env.AIMemoUrl || '',
             apiKey: process.env.AIMemoApi || '',
             maxTokensPerBatch: parseInt(process.env.AIMemoMaxTokensPerBatch) || 60000,
             promptFile: process.env.AIMemoPrompt || 'AIMemoPrompt.txt'
@@ -82,14 +78,10 @@ class AIMemoHandler {
                 if (presetResult) {
                     const { preset, rawContent } = presetResult;
                     presetContentForCache = rawContent; // 使用原始 JSON 内容作为缓存键的一部分
-                    // 🐛 Bug Fix: 预设 URL 也做规范化，确保末尾有 '/'
-                    const presetRawUrl = preset.AIMemoUrl || '';
-                    const presetUrl = presetRawUrl ? presetRawUrl.replace(/\/+$/, '') + '/' : currentConfig.url;
-
                     currentConfig = {
                         model: preset.AIMemoModel || currentConfig.model,
                         batchSize: parseInt(preset.AIMemoBatch) || currentConfig.batchSize,
-                        url: presetUrl,
+                        url: preset.AIMemoUrl || currentConfig.url,
                         apiKey: preset.AIMemoApi || currentConfig.apiKey,
                         maxTokensPerBatch: parseInt(preset.AIMemoMaxTokensPerBatch) || currentConfig.maxTokensPerBatch,
                         promptFile: preset.AIMemoPrompt || currentConfig.promptFile
@@ -241,8 +233,7 @@ class AIMemoHandler {
         const aiResponse = await this._callAIModel(prompt, config);
 
         if (!aiResponse) {
-            // 🐛 Bug Fix: 返回结构化对象而非裸字符串，防止调用方按对象属性访问时 TypeError
-            return { content: '[AI模型调用失败]', vcpInfo: null };
+            return '[AI模型调用失败]';
         }
 
         const extractedMemories = this._extractMemories(aiResponse);
@@ -372,14 +363,10 @@ class AIMemoHandler {
                 if (presetResult) {
                     const { preset, rawContent } = presetResult;
                     presetContentForCache = rawContent;
-                    // 🐛 Bug Fix: 预设 URL 也做规范化，确保末尾有 '/'
-                    const plusPresetRawUrl = preset.AIMemoUrl || '';
-                    const plusPresetUrl = plusPresetRawUrl ? plusPresetRawUrl.replace(/\/+$/, '') + '/' : currentConfig.url;
-
                     currentConfig = {
                         model: preset.AIMemoModel || currentConfig.model,
                         batchSize: parseInt(preset.AIMemoBatch) || currentConfig.batchSize,
-                        url: plusPresetUrl,
+                        url: preset.AIMemoUrl || currentConfig.url,
                         apiKey: preset.AIMemoApi || currentConfig.apiKey,
                         maxTokensPerBatch: parseInt(preset.AIMemoMaxTokensPerBatch) || currentConfig.maxTokensPerBatch,
                         promptFile: preset.AIMemoPrompt || currentConfig.promptFile

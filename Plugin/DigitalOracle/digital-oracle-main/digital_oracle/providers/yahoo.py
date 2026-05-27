@@ -83,25 +83,30 @@ class _YFinancePriceFetcher:
     def __init__(self) -> None:
         try:
             self._yf = importlib.import_module("yfinance")
-            return
         except ImportError:
-            pass
-
-        # Fall back to a repo-local .deps install if the global environment
-        # does not have yfinance available.
-        _deps = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, ".deps"
-        )
-        if os.path.isdir(_deps) and _deps not in sys.path:
-            sys.path.insert(0, _deps)
-
-        try:
-            self._yf = importlib.import_module("yfinance")
-        except ImportError:
-            raise ImportError(
-                "yfinance is required for YahooPriceProvider but is not installed.\n"
-                "Install it with:  uv pip install --target .deps yfinance\n"
+            # Fall back to a repo-local .deps install if the global environment
+            # does not have yfinance available.
+            _deps = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, ".deps"
             )
+            if os.path.isdir(_deps) and _deps not in sys.path:
+                sys.path.insert(0, _deps)
+
+            try:
+                self._yf = importlib.import_module("yfinance")
+            except ImportError:
+                raise ImportError(
+                    "yfinance is required for YahooPriceProvider but is not installed.\n"
+                    "Install it with:  uv pip install --target .deps yfinance\n"
+                )
+
+        # Configure proxy globally if set in environment variables
+        proxy_url = os.environ.get("DIGITAL_ORACLE_PROXY_URL") or os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("http_proxy") or os.environ.get("https_proxy")
+        if proxy_url:
+            try:
+                self._yf.config.network.proxy = {"http": proxy_url, "https": proxy_url}
+            except Exception:
+                pass
 
     def fetch_history(
         self,

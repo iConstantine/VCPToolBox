@@ -35,8 +35,8 @@
     "invocationCommands": [
       {
         "commandIdentifier": "SearchCode",
-        "description": "调用此工具在VCP项目源码中搜索指定的代码片段或关键词。支持使用正则表达式进行高级搜索。\n参数:\n- query (字符串, 必需): 需要搜索的关键词、代码片段或正则表达式。\n- search_path (字符串, 可选): 指定要搜索的相对路径。如果未提供，则默认为整个项目的工作区。\n- case_sensitive (布尔值, 可选, 默认false): 是否区分大小写搜索。\n- whole_word (布尔值, 可选, 默认false): 是否进行全词匹配。\n- context_lines (整数, 可选, 默认2): 返回结果时，在匹配行前后额外显示的上下文行数。\n\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」CodeSearcher「末」,\nquery:「始」关键词或正则表达式「末」,\nsearch_path:「始」(可选)相对路径「末」,\ncase_sensitive:「始」(可选)true/false「末」,\nwhole_word:「始」(可选)true/false「末」,\ncontext_lines:「始」(可选)数字「末」\n<<<[END_TOOL_REQUEST]>>>",
-        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」CodeSearcher「末」,\nquery:「始」function\\s+processToolCall\\(「末」,\nsearch_path:「始」modules「末」,\ncase_sensitive:「始」false「末」,\ncontext_lines:「始」3「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "调用此工具在VCP项目源码中搜索指定的代码片段或关键词。支持使用正则表达式进行高级搜索。\n参数:\n- query (字符串, 必需): 需要搜索的关键词、代码片段或正则表达式。\n- search_path (字符串, 强烈建议): 【极其重要：绝对路径警告！】必须使用服务器绝对路径（如 D:\\VCPToolBox-Official\\...）。因插件运行在独立子进程，传入相对路径会被锁死在插件自身的 CWD（当前工作目录）中，导致搜索失败返回空数组。如不提供，默认仅搜索插件自身文件夹，绝对不会搜索整个项目！\n- case_sensitive (布尔值, 可选, 默认false): 是否区分大小写搜索。\n- whole_word (布尔值, 可选, 默认false): 是否进行全词匹配。\n- context_lines (整数, 可选, 默认2): 返回结果时，在匹配行前后额外显示的上下文行数。\n\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」ServerCodeSearcher「末」,\nquery:「始」关键词或正则表达式「末」,\nsearch_path:「始」(可选)绝对路径「末」,\ncase_sensitive:「始」(可选)true/false「末」,\nwhole_word:「始」(可选)true/false「末」,\ncontext_lines:「始」(可选)数字「末」\n<<<[END_TOOL_REQUEST]>>>",
+        "example": "<<<[TOOL_REQUEST]>>>\ntool_name:「始」ServerCodeSearcher「末」,\nquery:「始」function\\s+processToolCall\\(「末」,\nsearch_path:「始」D:\\\\VCPToolBox-Official\\\\modules「末」,\ncase_sensitive:「始」false「末」,\ncontext_lines:「始」3「末」\n<<<[END_TOOL_REQUEST]>>>"
       }
     ]
   }

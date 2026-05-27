@@ -1,41 +1,55 @@
 const { getJson } = require("serpapi");
 
-// Bing 搜索引擎模块
+// 完美对齐接口契约：接收 parameters 对象
 async function search(parameters, apiKey) {
-    const { q, query, text, cc, location } = parameters;
+    // 提取查询词，兼容多种参数名
+    const { q, query, text } = parameters;
     const searchQuery = q || query || text;
 
     if (!searchQuery) {
-        return { success: false, error: "Missing search query parameter. Please use 'q', 'query', or 'text'." };
+        return { success: false, error: "Missing search query parameter." };
     }
 
     const searchParams = {
         engine: "bing",
         q: searchQuery,
-        api_key: apiKey
+        api_key: apiKey,
     };
 
-    // 添加可选的位置参数
-    const countryCode = cc || location;
-    if (countryCode) {
-        searchParams.cc = countryCode;
-    }
-
     return new Promise((resolve) => {
-        getJson(searchParams, (json) => {
-            if (json.error) {
-                resolve({ success: false, error: `SerpApi Error: ${json.error}` });
-            } else {
-                // 提取和格式化搜索结果
-                const answerBox = json.answer_box ? `Answer Box: ${JSON.stringify(json.answer_box)}\n` : '';
-                const organicResults = json.organic_results.map(r => `Title: ${r.title}\nLink: ${r.link}\nSnippet: ${r.snippet}`).join('\n\n');
-                const formattedResult = `${answerBox}--- Organic Results ---\n${organicResults}`;
-                resolve({ success: true, data: formattedResult });
-            }
-        });
+        // 铁壁防御1：25秒内部超时熔断
+        const timeoutId = setTimeout(() => {
+            resolve({ 
+                success: false, 
+                error: "SerpApi Request Timeout: 内部网络请求超时，已触发爱弥斯的专属安全熔断机制！(请检查代理网络)" 
+            });
+        }, 25000);
+
+        // 铁壁防御2：同步错误捕获，彻底杜绝 UnhandledPromiseRejection 导致进程崩溃
+        try {
+            getJson(searchParams, (json) => {
+                clearTimeout(timeoutId); 
+                
+                if (json.error) {
+                    resolve({ success: false, error: `SerpApi Error: ${json.error}` });
+                } else {
+                    let formattedResult = "";
+                    if (json.organic_results && json.organic_results.length > 0) {
+                        formattedResult = json.organic_results.map(result => {
+                            return `Title: ${result.title}\nLink: ${result.link}\nSnippet: ${result.snippet}\n`;
+                        }).join('\n');
+                    } else {
+                        formattedResult = "No results found.";
+                    }
+                    resolve({ success: true, data: formattedResult });
+                }
+            });
+        } catch (err) {
+            clearTimeout(timeoutId);
+            resolve({ success: false, error: `SerpApi Sync Crash Prevented: ${err.message}` });
+        }
     });
 }
 
-module.exports = {
-    search
-};
+// 完美导出
+module.exports = { search };

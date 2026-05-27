@@ -2658,9 +2658,7 @@ class RAGDiaryPlugin {
             modifiers,
             dynamicK,
             ghostTags, // 🌟 修复 2.4：将外部的 ghostTags 传入生成器
-            isFreshTimeConversationStart,
-            shotgunDecayFactor: this.ragParams?.RAGDiaryPlugin?.shotgunDecayFactor,
-            shotgunHistorySegmentLimit: this.ragParams?.RAGDiaryPlugin?.shotgunHistorySegmentLimit
+            isFreshTimeConversationStart
         });
 
         // 2️⃣ 尝试从缓存获取
@@ -2864,13 +2862,8 @@ class RAGDiaryPlugin {
             let searchVectors = [{ vector: finalQueryVector, type: 'current', weight: 1.0 }];
 
             if (historySegments && historySegments.length > 0) {
-                const config = this.ragParams?.RAGDiaryPlugin || {};
-                const historySegmentLimit = Math.max(0, parseInt(config.shotgunHistorySegmentLimit, 10) || 3);
-                const rawDecayFactor = Number(config.shotgunDecayFactor);
-                const decayFactor = Number.isFinite(rawDecayFactor)
-                    ? Math.max(0, Math.min(1, rawDecayFactor))
-                    : 0.85;
-                const recentSegments = historySegments.slice(-historySegmentLimit);
+                const recentSegments = historySegments.slice(-3);
+                const decayFactor = 0.85;
                 recentSegments.forEach((seg, idx) => {
                     const distance = recentSegments.length - idx;
                     const weightMultiplier = Math.pow(decayFactor, distance);
@@ -2878,7 +2871,7 @@ class RAGDiaryPlugin {
                 });
             }
 
-            console.log(`[RAGDiaryPlugin] Shotgun Query: Executing ${searchVectors.length} parallel searches (historyLimit=${Math.max(0, searchVectors.length - 1)}, decay=${searchVectors.length > 1 ? (searchVectors[1].weight ** (1 / Math.max(1, searchVectors.length - 1))).toFixed(3) : 'n/a'}).`);
+            console.log(`[RAGDiaryPlugin] Shotgun Query: Executing ${searchVectors.length} parallel searches...`);
 
             const searchPromises = searchVectors.map(async (qv) => {
                 try {
@@ -4118,9 +4111,7 @@ class RAGDiaryPlugin {
             ghostTags = [],
             autoWhitelist = null,
             autoBlacklist = null,
-            isFreshTimeConversationStart = false,
-            shotgunDecayFactor = null,
-            shotgunHistorySegmentLimit = null
+            isFreshTimeConversationStart = false
         } = params;
 
         const currentDate = modifiers.includes('::Time')
@@ -4143,9 +4134,7 @@ class RAGDiaryPlugin {
             ghosts: ghostTagString,
             auto_wl: autoWhitelist ? autoWhitelist.sort().join(',') : '',
             auto_bl: autoBlacklist ? autoBlacklist.sort().join(',') : '',
-            fresh_time_start: isFreshTimeConversationStart,
-            shotgun_decay: shotgunDecayFactor,
-            shotgun_history_limit: shotgunHistorySegmentLimit
+            fresh_time_start: isFreshTimeConversationStart
         });
     }
 
@@ -4312,43 +4301,15 @@ class RAGDiaryPlugin {
         return totalA + totalB > 0 ? (2 * intersection) / (totalA + totalB) : 0;
     }
 
-    _getFuzzyEmbeddingOptions(options = {}) {
-        const hotConfig = this.ragParams?.ContextFoldingV2?.fuzzyEmbedding || {};
-        const defaults = {
-            threshold: 0.985,
-            minLength: 80,
-            maxScan: 200,
-            maxLengthDiffRatio: 0.02,
-            maxLengthDiffAbs: 80
-        };
-
-        const readNumber = (key) => {
-            const optionValue = options[key];
-            if (Number.isFinite(Number(optionValue))) return Number(optionValue);
-            const hotValue = hotConfig[key];
-            if (Number.isFinite(Number(hotValue))) return Number(hotValue);
-            return defaults[key];
-        };
-
-        return {
-            threshold: readNumber('threshold'),
-            minLength: readNumber('minLength'),
-            maxScan: readNumber('maxScan'),
-            maxLengthDiffRatio: readNumber('maxLengthDiffRatio'),
-            maxLengthDiffAbs: readNumber('maxLengthDiffAbs')
-        };
-    }
-
     _findFuzzyEmbeddingFromCache(text, options = {}) {
         if (!text || typeof text !== 'string') return null;
 
         const normalizedText = text.trim();
-        const fuzzyOptions = this._getFuzzyEmbeddingOptions(options);
-        const threshold = fuzzyOptions.threshold;
-        const minLength = fuzzyOptions.minLength;
-        const maxScan = fuzzyOptions.maxScan;
-        const maxLengthDiffRatio = fuzzyOptions.maxLengthDiffRatio;
-        const maxLengthDiffAbs = fuzzyOptions.maxLengthDiffAbs;
+        const threshold = Number.isFinite(options.threshold) ? options.threshold : 0.985;
+        const minLength = Number.isFinite(options.minLength) ? options.minLength : 80;
+        const maxScan = Number.isFinite(options.maxScan) ? options.maxScan : 200;
+        const maxLengthDiffRatio = Number.isFinite(options.maxLengthDiffRatio) ? options.maxLengthDiffRatio : 0.02;
+        const maxLengthDiffAbs = Number.isFinite(options.maxLengthDiffAbs) ? options.maxLengthDiffAbs : 80;
 
         if (normalizedText.length < minLength || this.embeddingTextIndex.size === 0) {
             return null;

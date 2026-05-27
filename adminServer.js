@@ -62,6 +62,9 @@ const adminAuth = (req, res, next) => {
         '/AdminPanel/woff.css',
         '/AdminPanel/font.woff2'
     ];
+    
+    // Vue 构建产物中的 assets 目录（JS/CSS/字体等）
+    const isPublicAsset = req.path.startsWith('/AdminPanel/assets/');
 
     const isVerifyEndpoint = req.path === '/admin_api/verify-login';
 
@@ -74,7 +77,7 @@ const adminAuth = (req, res, next) => {
     ];
     const isReadOnlyPath = readOnlyDashboardPaths.some(p => req.path.startsWith(p));
 
-    if (publicPaths.includes(req.path)) {
+    if (publicPaths.includes(req.path) || isPublicAsset) {
         return next();
     }
 

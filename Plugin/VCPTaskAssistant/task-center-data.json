@@ -1,74 +1,9 @@
 {
   "version": 1,
-  "globalEnabled": true,
+  "globalEnabled": false,
   "settings": {
     "maxHistory": 200
   },
-  "tasks": [
-    {
-      "id": "fa_1779872163453",
-      "name": "日常记忆整理",
-      "type": "custom_prompt",
-      "enabled": false,
-      "schedule": {
-        "mode": "once",
-        "intervalMinutes": 60,
-        "runAt": "2026-05-27T17:09",
-        "cronValue": null,
-        "jitterSeconds": 0
-      },
-      "targets": {
-        "agents": [
-          "MemoriaSorter"
-        ]
-      },
-      "dispatch": {
-        "channel": "AgentAssistant",
-        "temporaryContact": true,
-        "maid": "VCP系统",
-        "taskDelegation": false
-      },
-      "payload": {
-        "promptTemplate": "帮我整理下微明的日记，包括微明的日记本，以及微明的知识日记本",
-        "availablePlaceholders": []
-      },
-      "runtime": {
-        "running": true,
-        "lastRunTime": "2026-05-27T09:08:37.320Z",
-        "lastFinishTime": null,
-        "lastResult": "running via manual-trigger",
-        "lastError": null,
-        "lastDurationMs": null,
-        "runCount": 2,
-        "successCount": 0,
-        "errorCount": 0,
-        "nextRunTime": "2026-05-27T09:09:00.000Z"
-      },
-      "meta": {
-        "createdAt": "2026-05-27T08:56:03.457Z",
-        "updatedAt": "2026-05-27T09:08:37.320Z"
-      }
-    }
-  ],
-  "history": [
-    {
-      "id": "run_1779872345321",
-      "taskId": "fa_1779872163453",
-      "taskName": "日常记忆整理",
-      "type": "custom_prompt",
-      "triggerSource": "manual-trigger",
-      "startedAt": "2026-05-27T08:56:05.307Z",
-      "finishedAt": "2026-05-27T08:59:05.321Z",
-      "durationMs": 180014,
-      "status": "error",
-      "agents": [
-        "MemoriaSorter"
-      ],
-      "originalAgents": [
-        "MemoriaSorter"
-      ],
-      "randomTag": null,
-      "message": "Agent MemoriaSorter 派发异常: 唤醒Agent超时 (180s): MemoriaSorter"
-    }
-  ]
+  "tasks": [],
+  "history": []
 }

@@ -1,7 +1,7 @@
-指南：如何使用服务器文件编辑器插件，ServerFileOperator来开发VCP插件？
+﻿指南：如何使用服务器文件编辑器插件，ServerFileOperator来开发VCP插件？
 
 首先，关于创建配置文件，plugin-manifest.json，由于其内部的description字段包含「始」，「末」标记，导致传统的tool function content无法处理。
-但没有关系，插件模组功能里的 WriteEscapedFile 可以处理这种特殊情况，通过输出文件内容为「始exp」，「末exp」，<<<[TOOL_REQUEST_EXP]>>>，<<<[END_TOOL_REQUEST_EXP]>>>插件会完成自动转译，从而构建正确格式的文件！
+但没有关系，插件模组功能里的 WriteEscapedFile 可以处理这种特殊情况，通过输出文件内容为「始exp」，「末exp」，<<<[TOOL_REQUEST]>>>，<<<[END_TOOL_REQUEST]>>>插件会完成自动转译，从而构建正确格式的文件！
 
 而config.env文件与其它类型文件则正常使用WriteFile操作即可！
 

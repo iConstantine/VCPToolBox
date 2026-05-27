@@ -1,0 +1,13 @@
+diff --git a/Plugin/ObsidianBridge/obsidian_bridge.js b/Plugin/ObsidianBridge/obsidian_bridge.js
+index 8d3597f..91d8125 100644
+--- a/Plugin/ObsidianBridge/obsidian_bridge.js
++++ b/Plugin/ObsidianBridge/obsidian_bridge.js
+@@ -48,7 +48,7 @@ function escapeValue(val, options = {}) {
+ }
+ 
+ function buildCommand(subcommand, params = {}, flags = [], vault = null) {
+-    const parts = [OBSIDIAN_CLI];
++    const parts = [`"${OBSIDIAN_CLI}"`];
+     if (vault) {
+         parts.push(`vault="${escapeValue(vault)}"`);
+     }
