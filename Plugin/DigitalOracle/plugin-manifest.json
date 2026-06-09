@@ -24,6 +24,16 @@
       "type": "boolean",
       "description": "是否输出调试级错误堆栈到插件返回结果 details 字段。",
       "default": false
+    },
+    "DIGITAL_ORACLE_PROXY_URL": {
+      "type": "string",
+      "description": "HTTP 代理地址（如 http://10.61.17.172:7890），用于访问 Yahoo Finance 等海外数据源。留空则不使用代理。建议在 VCP 根目录 config.env 中配置，不会被插件同步覆盖。",
+      "default": ""
+    },
+    "DIGITAL_ORACLE_PROXY_PORT": {
+      "type": "string",
+      "description": "HTTP 代理端口（仅当 DIGITAL_ORACLE_PROXY_URL 未设置时生效，默认解析为 127.0.0.1:端口）。推荐使用 DIGITAL_ORACLE_PROXY_URL 代替。",
+      "default": ""
     }
   },
   "capabilities": {
