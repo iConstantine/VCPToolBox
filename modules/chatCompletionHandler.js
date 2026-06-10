@@ -1,54 +1,60 @@
 // modules/chatCompletionHandler.js
-const messageProcessor = require('./messageProcessor.js');
-const vcpInfoHandler = require('../vcpInfoHandler.js');
-const contextManager = require('./contextManager.js');
-const roleDivider = require('./roleDivider.js');
-const fs = require('fs').promises;
-const path = require('path');
-const http = require('http');
-const https = require('https');
-const finalContextStore = require('./finalContextStore.js');
+const messageProcessor = require("./messageProcessor.js");
+const vcpInfoHandler = require("../vcpInfoHandler.js");
+const contextManager = require("./contextManager.js");
+const roleDivider = require("./roleDivider.js");
+const fs = require("fs").promises;
+const path = require("path");
+const http = require("http");
+const https = require("https");
+const finalContextStore = require("./finalContextStore.js");
 
 // 🌟 核心网络优化：引入防御性长连接池 (Keep-Alive Pool)
 // 解决 "-1s Socket Hang Up" 与上游代理秒断僵尸连接的问题
 const agentOptions = {
   keepAlive: true,
-  keepAliveMsecs: 1000,     // 维持 Node.js 默认的 1s TCP 探针间隔
-  freeSocketTimeout: 8000,  // 绝杀机制：空闲 Socket 8 秒后主动销毁，防止复用到被上游代理 (如 Nginx) 静默杀死的僵尸连接
-  scheduling: 'lifo',       // 后进先出：永远优先复用刚刚才活跃过、最新鲜的热连接
-  maxSockets: 10000         // 维持全局高并发上限
+  keepAliveMsecs: 1000, // 维持 Node.js 默认的 1s TCP 探针间隔
+  freeSocketTimeout: 8000, // 绝杀机制：空闲 Socket 8 秒后主动销毁，防止复用到被上游代理 (如 Nginx) 静默杀死的僵尸连接
+  scheduling: "lifo", // 后进先出：永远优先复用刚刚才活跃过、最新鲜的热连接
+  maxSockets: 10000, // 维持全局高并发上限
 };
 const keepAliveHttpAgent = new http.Agent(agentOptions);
 const keepAliveHttpsAgent = new https.Agent(agentOptions);
 
-const getFetchAgent = function(_parsedURL) {
-  return _parsedURL.protocol === 'http:' ? keepAliveHttpAgent : keepAliveHttpsAgent;
+const getFetchAgent = function (_parsedURL) {
+  return _parsedURL.protocol === "http:"
+    ? keepAliveHttpAgent
+    : keepAliveHttpsAgent;
 };
 
-const { getAuthCode } = require('./captchaDecoder');
-const ToolCallParser = require('./vcpLoop/toolCallParser');
-const ToolExecutor = require('./vcpLoop/toolExecutor');
-const StreamHandler = require('./handlers/streamHandler');
-const NonStreamHandler = require('./handlers/nonStreamHandler');
+const { getAuthCode } = require("./captchaDecoder");
+const ToolCallParser = require("./vcpLoop/toolCallParser");
+const ToolExecutor = require("./vcpLoop/toolExecutor");
+const StreamHandler = require("./handlers/streamHandler");
+const NonStreamHandler = require("./handlers/nonStreamHandler");
 
-const VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER = '[[VCPToolUse=Forbidden]]';
+const VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER = "[[VCPToolUse=Forbidden]]";
 
 function parseBooleanEnv(value, defaultValue = false) {
-  if (value === undefined || value === null || value === '') return defaultValue;
-  return String(value).toLowerCase() === 'true';
+  if (value === undefined || value === null || value === "")
+    return defaultValue;
+  return String(value).toLowerCase() === "true";
 }
 
 function normalizeClientIp(ip) {
-  if (ip && ip.substr(0, 7) === '::ffff:') {
+  if (ip && ip.substr(0, 7) === "::ffff:") {
     return ip.substr(7);
   }
-  return ip || 'unknown';
+  return ip || "unknown";
 }
 
 class ResponseReplayCache {
   constructor({ enabled = false, maxEntries = 100, debugMode = false } = {}) {
     this.enabled = enabled;
-    this.maxEntries = Number.isFinite(maxEntries) && maxEntries > 0 ? Math.floor(maxEntries) : 100;
+    this.maxEntries =
+      Number.isFinite(maxEntries) && maxEntries > 0
+        ? Math.floor(maxEntries)
+        : 100;
     this.debugMode = debugMode;
     this.cache = new Map();
   }
@@ -67,12 +73,21 @@ class ResponseReplayCache {
   }
 
   set(key, entry) {
-    if (!this.enabled || !key || !entry || !Array.isArray(entry.chunks) || entry.chunks.length === 0) return;
+    if (
+      !this.enabled ||
+      !key ||
+      !entry ||
+      !Array.isArray(entry.chunks) ||
+      entry.chunks.length === 0
+    )
+      return;
     if (this.cache.has(key)) this.cache.delete(key);
     this.cache.set(key, {
       ...entry,
-      chunks: entry.chunks.map(chunk => Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(String(chunk))),
-      cachedAt: Date.now()
+      chunks: entry.chunks.map((chunk) =>
+        Buffer.isBuffer(chunk) ? Buffer.from(chunk) : Buffer.from(String(chunk))
+      ),
+      cachedAt: Date.now(),
     });
 
     while (this.cache.size > this.maxEntries) {
@@ -81,7 +96,9 @@ class ResponseReplayCache {
     }
 
     if (this.debugMode) {
-      console.log(`[ResponseReplayCache] Cached response for key=${key}. entries=${this.cache.size}/${this.maxEntries}`);
+      console.log(
+        `[ResponseReplayCache] Cached response for key=${key}. entries=${this.cache.size}/${this.maxEntries}`
+      );
     }
   }
 
@@ -90,7 +107,9 @@ class ResponseReplayCache {
     if (!entry) return false;
 
     if (this.debugMode) {
-      console.log(`[ResponseReplayCache] Replaying cached response for key=${key}. No tool chain will be executed.`);
+      console.log(
+        `[ResponseReplayCache] Replaying cached response for key=${key}. No tool chain will be executed.`
+      );
     }
 
     if (!res.headersSent) {
@@ -115,7 +134,10 @@ class ResponseReplayCache {
   }
 }
 
-function installResponseCacheRecorder(res, { cache, cacheKey, id, clientIp, streamMode, debugMode }) {
+function installResponseCacheRecorder(
+  res,
+  { cache, cacheKey, id, clientIp, streamMode, debugMode }
+) {
   if (!cache?.enabled || !cacheKey || res.__vcpReplayCacheRecorderInstalled) {
     return () => {};
   }
@@ -132,7 +154,12 @@ function installResponseCacheRecorder(res, { cache, cacheKey, id, clientIp, stre
     if (Buffer.isBuffer(chunk)) {
       capturedChunks.push(Buffer.from(chunk));
     } else {
-      capturedChunks.push(Buffer.from(String(chunk), typeof encoding === 'string' ? encoding : 'utf8'));
+      capturedChunks.push(
+        Buffer.from(
+          String(chunk),
+          typeof encoding === "string" ? encoding : "utf8"
+        )
+      );
     }
   };
 
@@ -158,14 +185,16 @@ function installResponseCacheRecorder(res, { cache, cacheKey, id, clientIp, stre
         streamMode,
         statusCode,
         headers: res.getHeaders ? res.getHeaders() : {},
-        chunks: capturedChunks
+        chunks: capturedChunks,
       });
     } else if (debugMode) {
-      console.log(`[ResponseReplayCache] Skip caching key=${cacheKey}, status=${statusCode}, chunks=${capturedChunks.length}`);
+      console.log(
+        `[ResponseReplayCache] Skip caching key=${cacheKey}, status=${statusCode}, chunks=${capturedChunks.length}`
+      );
     }
   };
 
-  res.once('finish', finalize);
+  res.once("finish", finalize);
 
   return finalize;
 }
@@ -181,18 +210,26 @@ function consumeVcpToolUseForbiddenPlaceholder(messages) {
 
   let found = false;
   for (const msg of messages) {
-    if (!msg || msg.role !== 'system') break;
+    if (!msg || msg.role !== "system") break;
 
-    if (typeof msg.content === 'string') {
+    if (typeof msg.content === "string") {
       if (msg.content.includes(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER)) {
         found = true;
-        msg.content = msg.content.split(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER).join('');
+        msg.content = msg.content
+          .split(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER)
+          .join("");
       }
     } else if (Array.isArray(msg.content)) {
       for (const part of msg.content) {
-        if (part?.type === 'text' && typeof part.text === 'string' && part.text.includes(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER)) {
+        if (
+          part?.type === "text" &&
+          typeof part.text === "string" &&
+          part.text.includes(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER)
+        ) {
           found = true;
-          part.text = part.text.split(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER).join('');
+          part.text = part.text
+            .split(VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER)
+            .join("");
         }
       }
     }
@@ -234,14 +271,17 @@ function isToolResultError(result) {
   }
 
   // 1. 对象形式的错误检测
-  if (typeof result === 'object') {
+  if (typeof result === "object") {
     // 检查常见的错误标识字段
-    if (result.error === true ||
+    if (
+      result.error === true ||
       result.success === false ||
-      result.status === 'error' ||
-      result.status === 'failed' ||
-      result.code?.toString().startsWith('4') || // 4xx 错误码
-      result.code?.toString().startsWith('5')) { // 5xx 错误码
+      result.status === "error" ||
+      result.status === "failed" ||
+      result.code?.toString().startsWith("4") || // 4xx 错误码
+      result.code?.toString().startsWith("5")
+    ) {
+      // 5xx 错误码
       return true;
     }
 
@@ -255,12 +295,17 @@ function isToolResultError(result) {
   }
 
   // 2. 字符串形式的错误检测（模糊匹配）
-  if (typeof result === 'string') {
+  if (typeof result === "string") {
     const lowerResult = result.toLowerCase();
 
     // 检查是否以错误前缀开头（更可靠的判断）
     const errorPrefixes = [
-      '[error]', '[错误]', '[失败]', 'error:', '错误：', '失败：'
+      "[error]",
+      "[错误]",
+      "[失败]",
+      "error:",
+      "错误：",
+      "失败：",
     ];
     for (const prefix of errorPrefixes) {
       if (lowerResult.startsWith(prefix)) {
@@ -270,8 +315,12 @@ function isToolResultError(result) {
 
     // 模糊匹配（需要更谨慎）
     // 只有在明确包含"错误"或"失败"这类强指示词时才认为是错误
-    if (result.includes('错误') || result.includes('失败') ||
-      lowerResult.includes('error:') || lowerResult.includes('failed:')) {
+    if (
+      result.includes("错误") ||
+      result.includes("失败") ||
+      lowerResult.includes("error:") ||
+      lowerResult.includes("failed:")
+    ) {
       return true;
     }
   }
@@ -286,9 +335,9 @@ function isToolResultError(result) {
  */
 function formatToolResult(result) {
   if (result === undefined || result === null) {
-    return '(无返回内容)';
+    return "(无返回内容)";
   }
-  if (typeof result === 'object') {
+  if (typeof result === "object") {
     return JSON.stringify(result, null, 2);
   }
   return String(result);
@@ -296,43 +345,69 @@ function formatToolResult(result) {
 
 async function getRealAuthCode(debugMode = false) {
   try {
-    const authCodePath = path.join(__dirname, '..', 'Plugin', 'UserAuth', 'code.bin');
+    const authCodePath = path.join(
+      __dirname,
+      "..",
+      "Plugin",
+      "UserAuth",
+      "code.bin"
+    );
     // 使用正确的 getAuthCode 函数，它会自行处理文件读取和解码
     return await getAuthCode(authCodePath);
   } catch (error) {
     if (debugMode) {
-      console.error('[VCPToolCode] Failed to read or decrypt auth code:', error);
+      console.error(
+        "[VCPToolCode] Failed to read or decrypt auth code:",
+        error
+      );
     }
     return null; // Return null if code cannot be obtained
   }
 }
 
-function applyModelFallbackForAttempt(options, candidates, attemptIndex, debugMode = false) {
-  if (!Array.isArray(candidates) || candidates.length === 0 || !options || typeof options.body !== 'string') {
+function applyModelFallbackForAttempt(
+  options,
+  candidates,
+  attemptIndex,
+  debugMode = false
+) {
+  if (
+    !Array.isArray(candidates) ||
+    candidates.length === 0 ||
+    !options ||
+    typeof options.body !== "string"
+  ) {
     return options;
   }
 
-  const selectedModel = candidates[Math.min(attemptIndex, candidates.length - 1)];
+  const selectedModel =
+    candidates[Math.min(attemptIndex, candidates.length - 1)];
   if (!selectedModel) return options;
 
   try {
     const parsedBody = JSON.parse(options.body);
-    if (!parsedBody || typeof parsedBody !== 'object') return options;
+    if (!parsedBody || typeof parsedBody !== "object") return options;
 
     const previousModel = parsedBody.model;
     parsedBody.model = selectedModel;
 
     if (debugMode && previousModel !== selectedModel) {
-      console.log(`[SemanticModelRouter] 容灾切换上游模型: ${previousModel} -> ${selectedModel} (attempt=${attemptIndex + 1})`);
+      console.log(
+        `[SemanticModelRouter] 容灾切换上游模型: ${previousModel} -> ${selectedModel} (attempt=${
+          attemptIndex + 1
+        })`
+      );
     }
 
     return {
       ...options,
-      body: JSON.stringify(parsedBody)
+      body: JSON.stringify(parsedBody),
     };
   } catch (error) {
     if (debugMode) {
-      console.warn(`[SemanticModelRouter] 无法为本次重试替换模型，继续使用原始请求体: ${error.message}`);
+      console.warn(
+        `[SemanticModelRouter] 无法为本次重试替换模型，继续使用原始请求体: ${error.message}`
+      );
     }
     return options;
   }
@@ -343,11 +418,20 @@ function applyModelFallbackForAttempt(options, candidates, attemptIndex, debugMo
 async function fetchWithRetry(
   url,
   options,
-  { retries = 3, delay = 1000, debugMode = false, onRetry = null, connectionTimeout = 120000, modelFallbackCandidates = null } = {},
+  {
+    retries = 3,
+    delay = 1000,
+    debugMode = false,
+    onRetry = null,
+    connectionTimeout = 120000,
+    modelFallbackCandidates = null,
+  } = {}
 ) {
-  const { default: fetch } = await import('node-fetch');
+  const { default: fetch } = await import("node-fetch");
   const maxAttempts = Math.max(
-    Number.isFinite(Number(retries)) && Number(retries) > 0 ? Math.floor(Number(retries)) : 1,
+    Number.isFinite(Number(retries)) && Number(retries) > 0
+      ? Math.floor(Number(retries))
+      : 1,
     Array.isArray(modelFallbackCandidates) ? modelFallbackCandidates.length : 0
   );
   for (let i = 0; i < maxAttempts; i++) {
@@ -360,17 +444,24 @@ async function fetchWithRetry(
     let removeExternalListener = null;
     if (externalSignal) {
       if (externalSignal.aborted) {
-        throw Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' });
+        throw Object.assign(new Error("The operation was aborted."), {
+          name: "AbortError",
+        });
       }
       const forwardAbort = () => attemptController.abort();
-      externalSignal.addEventListener('abort', forwardAbort, { once: true });
-      removeExternalListener = () => externalSignal.removeEventListener('abort', forwardAbort);
+      externalSignal.addEventListener("abort", forwardAbort, { once: true });
+      removeExternalListener = () =>
+        externalSignal.removeEventListener("abort", forwardAbort);
     }
 
     // 设置连接超时
-    const timeoutId = connectionTimeout > 0
-      ? setTimeout(() => { didTimeout = true; attemptController.abort(); }, connectionTimeout)
-      : null;
+    const timeoutId =
+      connectionTimeout > 0
+        ? setTimeout(() => {
+            didTimeout = true;
+            attemptController.abort();
+          }, connectionTimeout)
+        : null;
 
     const cleanup = () => {
       if (timeoutId) clearTimeout(timeoutId);
@@ -378,7 +469,12 @@ async function fetchWithRetry(
     };
 
     try {
-      const attemptOptions = applyModelFallbackForAttempt(options, modelFallbackCandidates, i, debugMode);
+      const attemptOptions = applyModelFallbackForAttempt(
+        options,
+        modelFallbackCandidates,
+        i,
+        debugMode
+      );
       const response = await fetch(url, {
         ...attemptOptions,
         agent: getFetchAgent, // 注入防御性长连接池
@@ -386,7 +482,10 @@ async function fetchWithRetry(
       });
       cleanup();
 
-      let shouldRetryStatus = response.status === 500 || response.status === 503 || response.status === 429;
+      let shouldRetryStatus =
+        response.status === 500 ||
+        response.status === 503 ||
+        response.status === 429;
       let retryMessage = response.statusText;
 
       // Gemini / NewAPI 偶发特殊空回：上游可能以 401 返回包含 token 的错误文本
@@ -395,13 +494,15 @@ async function fetchWithRetry(
       if (response.status === 401) {
         try {
           const responseBodyText = await response.clone().text();
-          if (responseBodyText.toLowerCase().includes('token')) {
+          if (responseBodyText.toLowerCase().includes("token")) {
             shouldRetryStatus = true;
             retryMessage = responseBodyText || response.statusText;
           }
         } catch (bodyReadError) {
           if (debugMode) {
-            console.warn(`[Fetch Retry] Failed to inspect 401 response body: ${bodyReadError.message}`);
+            console.warn(
+              `[Fetch Retry] Failed to inspect 401 response body: ${bodyReadError.message}`
+            );
           }
         }
       }
@@ -410,13 +511,18 @@ async function fetchWithRetry(
         const currentDelay = delay * (i + 1);
         if (debugMode) {
           console.warn(
-            `[Fetch Retry] Received status ${response.status}. Retrying in ${currentDelay}ms... (${i + 1}/${retries})`,
+            `[Fetch Retry] Received status ${
+              response.status
+            }. Retrying in ${currentDelay}ms... (${i + 1}/${retries})`
           );
         }
         if (onRetry) {
-          await onRetry(i + 1, { status: response.status, message: retryMessage });
+          await onRetry(i + 1, {
+            status: response.status,
+            message: retryMessage,
+          });
         }
-        await new Promise(resolve => setTimeout(resolve, currentDelay));
+        await new Promise((resolve) => setTimeout(resolve, currentDelay));
         continue;
       }
       return response;
@@ -424,7 +530,7 @@ async function fetchWithRetry(
       cleanup();
 
       // 区分超时中止和外部中止
-      if (error.name === 'AbortError') {
+      if (error.name === "AbortError") {
         if (didTimeout) {
           // 超时中止 → 视为可重试的网络错误
           const msg = `Connection timed out after ${connectionTimeout / 1000}s`;
@@ -432,42 +538,62 @@ async function fetchWithRetry(
             console.error(`[Fetch Retry] ${msg}. All retries exhausted.`);
             throw new Error(msg);
           }
-          if (debugMode) console.warn(`[Fetch Retry] ${msg}. Retrying... (${i + 1}/${retries})`);
+          if (debugMode)
+            console.warn(
+              `[Fetch Retry] ${msg}. Retrying... (${i + 1}/${retries})`
+            );
           if (onRetry) {
-            await onRetry(i + 1, { status: 'TIMEOUT', message: msg });
+            await onRetry(i + 1, { status: "TIMEOUT", message: msg });
           }
-          await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
+          await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
           continue;
         }
         // 外部中止（用户取消）→ 不重试
-        if (debugMode) console.log('[Fetch Retry] Request was aborted. No retries will be attempted.');
+        if (debugMode)
+          console.log(
+            "[Fetch Retry] Request was aborted. No retries will be attempted."
+          );
         throw error;
       }
 
       if (i === maxAttempts - 1) {
-        console.error(`[Fetch Retry] All retries failed. Last error: ${error.message}`);
+        console.error(
+          `[Fetch Retry] All retries failed. Last error: ${error.message}`
+        );
         throw error;
       }
       if (debugMode) {
         console.warn(
-          `[Fetch Retry] Fetch failed with error: ${error.message}. Retrying in ${delay}ms... (${i + 1}/${retries})`,
+          `[Fetch Retry] Fetch failed with error: ${
+            error.message
+          }. Retrying in ${delay}ms... (${i + 1}/${retries})`
         );
       }
       if (onRetry) {
-        await onRetry(i + 1, { status: 'NETWORK_ERROR', message: error.message });
+        await onRetry(i + 1, {
+          status: "NETWORK_ERROR",
+          message: error.message,
+        });
       }
-      await new Promise(resolve => setTimeout(resolve, delay * (i + 1)));
+      await new Promise((resolve) => setTimeout(resolve, delay * (i + 1)));
     }
   }
-  throw new Error('Fetch failed after all retries.');
+  throw new Error("Fetch failed after all retries.");
 }
 // 辅助函数：根据新上下文刷新对话历史中的RAG区块
-async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, debugMode = false) {
-  const ragPlugin = pluginManager.messagePreprocessors?.get('RAGDiaryPlugin');
+async function _refreshRagBlocksIfNeeded(
+  messages,
+  newContext,
+  pluginManager,
+  debugMode = false
+) {
+  const ragPlugin = pluginManager.messagePreprocessors?.get("RAGDiaryPlugin");
   // 检查插件是否存在且是否实现了refreshRagBlock方法
-  if (!ragPlugin || typeof ragPlugin.refreshRagBlock !== 'function') {
+  if (!ragPlugin || typeof ragPlugin.refreshRagBlock !== "function") {
     if (debugMode) {
-      console.log('[VCP Refresh] RAGDiaryPlugin 未找到或版本不兼容 (缺少 refreshRagBlock)，跳过刷新。');
+      console.log(
+        "[VCP Refresh] RAGDiaryPlugin 未找到或版本不兼容 (缺少 refreshRagBlock)，跳过刷新。"
+      );
     }
     return messages;
   }
@@ -477,16 +603,20 @@ async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, de
   let hasRefreshed = false;
 
   // 🟢 改进点1：使用更健壮的正则 [\s\S]*? 匹配跨行内容，并允许标签周围有空格
-  const ragBlockRegex = /<!-- VCP_RAG_BLOCK_START ([\s\S]*?) -->([\s\S]*?)<!-- VCP_RAG_BLOCK_END -->/g;
+  const ragBlockRegex =
+    /<!-- VCP_RAG_BLOCK_START ([\s\S]*?) -->([\s\S]*?)<!-- VCP_RAG_BLOCK_END -->/g;
 
   for (let i = 0; i < newMessages.length; i++) {
     // 只处理 assistant 和 system 角色中的字符串内容
     // 🟢 改进点2：有些场景下 RAG 可能会被注入到 user 消息中，建议也检查 user
-    if (['assistant', 'system', 'user'].includes(newMessages[i].role) && typeof newMessages[i].content === 'string') {
+    if (
+      ["assistant", "system", "user"].includes(newMessages[i].role) &&
+      typeof newMessages[i].content === "string"
+    ) {
       let messageContent = newMessages[i].content;
 
       // 快速检查是否存在标记，避免无效正则匹配
-      if (!messageContent.includes('VCP_RAG_BLOCK_START')) {
+      if (!messageContent.includes("VCP_RAG_BLOCK_START")) {
         continue;
       }
 
@@ -495,7 +625,10 @@ async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, de
       const matches = [...messageContent.matchAll(ragBlockRegex)];
 
       if (matches.length > 0) {
-        if (debugMode) console.log(`[VCP Refresh] 消息[${i}]中发现 ${matches.length} 个 RAG 区块，准备刷新...`);
+        if (debugMode)
+          console.log(
+            `[VCP Refresh] 消息[${i}]中发现 ${matches.length} 个 RAG 区块，准备刷新...`
+          );
 
         // 我们从后往前替换，这样替换操作不会影响前面匹配项的索引位置（虽然 replace(str) 不依赖索引，但这是一个好习惯）
         // 这里为了简单，我们直接构建一个新的 content 字符串或使用 split/join 策略
@@ -513,33 +646,46 @@ async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, de
             }
 
             // V4.0: Find the last *true* user message to use as the original query
-            let originalUserQuery = '';
+            let originalUserQuery = "";
             // Search backwards from the message *before* the one containing the RAG block
             for (let j = i - 1; j >= 0; j--) {
               const prevMsg = newMessages[j];
-              if (prevMsg.role === 'user' && typeof prevMsg.content === 'string' &&
-                !prevMsg.content.startsWith('<!-- VCP_TOOL_PAYLOAD -->') &&
-                !prevMsg.content.startsWith('[系统提示:]') &&
-                !prevMsg.content.startsWith('[系统邀请指令:]')
+              if (
+                prevMsg.role === "user" &&
+                typeof prevMsg.content === "string" &&
+                !prevMsg.content.startsWith("<!-- VCP_TOOL_PAYLOAD -->") &&
+                !prevMsg.content.startsWith("[系统提示:]") &&
+                !prevMsg.content.startsWith("[系统邀请指令:]")
               ) {
                 originalUserQuery = prevMsg.content;
-                if (debugMode) console.log(`[VCP Refresh] Found original user query for refresh at index ${j}.`);
+                if (debugMode)
+                  console.log(
+                    `[VCP Refresh] Found original user query for refresh at index ${j}.`
+                  );
                 break; // Found it, stop searching
               }
             }
             if (!originalUserQuery && debugMode) {
-              console.warn(`[VCP Refresh] Could not find a true user query for the RAG block at index ${i}. Refresh may be inaccurate.`);
+              console.warn(
+                `[VCP Refresh] Could not find a true user query for the RAG block at index ${i}. Refresh may be inaccurate.`
+              );
             }
 
             // 调用 RAG 插件的刷新接口, now with originalUserQuery
-            const newBlock = await ragPlugin.refreshRagBlock(metadata, newContext, originalUserQuery);
+            const newBlock = await ragPlugin.refreshRagBlock(
+              metadata,
+              newContext,
+              originalUserQuery
+            );
 
             // 🟢 改进点4：关键修复！使用回调函数进行替换，防止 newBlock 中的 "$" 符号被解析为正则特殊字符
             // 这是一个极其常见的 Bug，导致包含 $ 的内容（如公式、代码）替换失败或乱码
-            messageContent = messageContent.replace(fullMatchString, () => newBlock);
+            messageContent = messageContent.replace(
+              fullMatchString,
+              () => newBlock
+            );
 
             hasRefreshed = true;
-
           } catch (e) {
             console.error("[VCP Refresh] 刷新 RAG 区块失败:", e.message);
             if (debugMode) console.error(e);
@@ -552,7 +698,9 @@ async function _refreshRagBlocksIfNeeded(messages, newContext, pluginManager, de
   }
 
   if (hasRefreshed && debugMode) {
-    console.log("[VCP Refresh] ✅ 对话历史中的 RAG 记忆区块已根据新上下文成功刷新。");
+    console.log(
+      "[VCP Refresh] ✅ 对话历史中的 RAG 记忆区块已根据新上下文成功刷新。"
+    );
   }
 
   return newMessages;
@@ -562,16 +710,25 @@ class ChatCompletionHandler {
   constructor(config) {
     this.config = config;
     this.responseReplayCache = new ResponseReplayCache({
-      enabled: parseBooleanEnv(config.responseReplayCacheEnabled ?? process.env.ResponseReplayCacheEnabled, false),
-      maxEntries: parseInt(config.responseReplayCacheMaxEntries ?? process.env.ResponseReplayCacheMaxEntries, 10) || 100,
-      debugMode: config.DEBUG_MODE
+      enabled: parseBooleanEnv(
+        config.responseReplayCacheEnabled ??
+          process.env.ResponseReplayCacheEnabled,
+        false
+      ),
+      maxEntries:
+        parseInt(
+          config.responseReplayCacheMaxEntries ??
+            process.env.ResponseReplayCacheMaxEntries,
+          10
+        ) || 100,
+      debugMode: config.DEBUG_MODE,
     });
     this.toolExecutor = new ToolExecutor({
       pluginManager: config.pluginManager,
       webSocketServer: config.webSocketServer,
       debugMode: config.DEBUG_MODE,
       vcpToolCode: config.VCPToolCode,
-      getRealAuthCode: getRealAuthCode
+      getRealAuthCode: getRealAuthCode,
     });
   }
 
@@ -607,12 +764,20 @@ class ChatCompletionHandler {
 
     const shouldShowVCP = SHOW_VCP_OUTPUT || forceShowVCP;
     const applyChinaModelThinkingControl = (body) => {
-      if (!body || !body.model || !chinaModel1 || !Array.isArray(chinaModel1) || chinaModel1.length === 0) {
+      if (
+        !body ||
+        !body.model ||
+        !chinaModel1 ||
+        !Array.isArray(chinaModel1) ||
+        chinaModel1.length === 0
+      ) {
         return body;
       }
 
       const modelNameLower = String(body.model).toLowerCase();
-      const isChinaModel = chinaModel1.some(m => modelNameLower.includes(String(m).toLowerCase()));
+      const isChinaModel = chinaModel1.some((m) =>
+        modelNameLower.includes(String(m).toLowerCase())
+      );
       if (!isChinaModel) return body;
 
       if (chinaModel1Cot) {
@@ -622,7 +787,11 @@ class ChatCompletionHandler {
       }
 
       if (DEBUG_MODE) {
-        console.log(`[ChinaModel] 模型 '${body.model}' 匹配成功。思维链状态: ${chinaModel1Cot ? '开启 (enabled)' : '关闭 (已移除字段)'}`);
+        console.log(
+          `[ChinaModel] 模型 '${body.model}' 匹配成功。思维链状态: ${
+            chinaModel1Cot ? "开启 (enabled)" : "关闭 (已移除字段)"
+          }`
+        );
       }
 
       return body;
@@ -632,15 +801,20 @@ class ChatCompletionHandler {
 
     const id = req.body.requestId || req.body.messageId;
     let originalBody = req.body;
-    const vcpchatExtensions = originalBody && typeof originalBody === 'object'
-      ? originalBody.vcpchatExtensions
-      : null;
+    const vcpchatExtensions =
+      originalBody && typeof originalBody === "object"
+        ? originalBody.vcpchatExtensions
+        : null;
     if (vcpchatExtensions !== undefined) {
       delete originalBody.vcpchatExtensions;
-      const bindingCount = Array.isArray(vcpchatExtensions?.messageTimestampBindings)
+      const bindingCount = Array.isArray(
+        vcpchatExtensions?.messageTimestampBindings
+      )
         ? vcpchatExtensions.messageTimestampBindings.length
         : 0;
-      console.log(`[VCPChatExtensions] Intercepted and stripped vcpchatExtensions before upstream forwarding. timestampBindings=${bindingCount}`);
+      console.log(
+        `[VCPChatExtensions] Intercepted and stripped vcpchatExtensions before upstream forwarding. timestampBindings=${bindingCount}`
+      );
     }
     const requestPreprocessorConfig = vcpchatExtensions
       ? { vcpchatExtensions }
@@ -648,7 +822,10 @@ class ChatCompletionHandler {
     const isOriginalRequestStreaming = originalBody.stream === true;
     const responseCacheKey = this.responseReplayCache.buildKey(clientIp, id);
 
-    if (responseCacheKey && this.responseReplayCache.replay(responseCacheKey, req, res)) {
+    if (
+      responseCacheKey &&
+      this.responseReplayCache.replay(responseCacheKey, req, res)
+    ) {
       return;
     }
 
@@ -665,7 +842,7 @@ class ChatCompletionHandler {
         id,
         clientIp,
         streamMode: isOriginalRequestStreaming,
-        debugMode: DEBUG_MODE
+        debugMode: DEBUG_MODE,
       });
     }
 
@@ -676,7 +853,7 @@ class ChatCompletionHandler {
         abortController,
         timestamp: Date.now(),
         aborted: false, // 修复 Bug #4: 添加中止标志
-        abortReason: null
+        abortReason: null,
       });
 
       // 通用前端兼容：如果客户端没有显式调用 /v1/interrupt，
@@ -699,29 +876,32 @@ class ChatCompletionHandler {
           abortController.abort();
         }
 
-        console.log(`[ClientDisconnect] Request ${id} aborted due to ${reason}. Upstream cascade abort triggered.`);
+        console.log(
+          `[ClientDisconnect] Request ${id} aborted due to ${reason}. Upstream cascade abort triggered.`
+        );
       };
 
-      const onReqAborted = () => triggerClientDisconnectAbort('request_aborted');
+      const onReqAborted = () =>
+        triggerClientDisconnectAbort("request_aborted");
       const onReqClose = () => {
         if (req.aborted && !res.writableEnded) {
-          triggerClientDisconnectAbort('request_close_after_abort');
+          triggerClientDisconnectAbort("request_close_after_abort");
         }
       };
       const onResClose = () => {
         if (!res.writableEnded) {
-          triggerClientDisconnectAbort('response_close_before_finish');
+          triggerClientDisconnectAbort("response_close_before_finish");
         }
       };
 
-      req.on('aborted', onReqAborted);
-      req.on('close', onReqClose);
-      res.on('close', onResClose);
+      req.on("aborted", onReqAborted);
+      req.on("close", onReqClose);
+      res.on("close", onResClose);
 
       cleanupClientDisconnectListeners = () => {
-        req.off('aborted', onReqAborted);
-        req.off('close', onReqClose);
-        res.off('close', onResClose);
+        req.off("aborted", onReqAborted);
+        req.off("close", onReqClose);
+        res.off("close", onResClose);
       };
     }
 
@@ -729,7 +909,10 @@ class ChatCompletionHandler {
     // 1. 拦截 contextTokenLimit 参数
     const contextTokenLimit = originalBody.contextTokenLimit;
     if (contextTokenLimit !== undefined) {
-      if (DEBUG_MODE) console.log(`[ContextControl] 检测到 contextTokenLimit: ${contextTokenLimit}`);
+      if (DEBUG_MODE)
+        console.log(
+          `[ContextControl] 检测到 contextTokenLimit: ${contextTokenLimit}`
+        );
       // 2. 从发送给后端的 body 中移除该参数
       delete originalBody.contextTokenLimit;
 
@@ -742,7 +925,9 @@ class ChatCompletionHandler {
           DEBUG_MODE
         );
         if (DEBUG_MODE && originalBody.messages.length < originalCount) {
-          console.log(`[ContextControl] 上下文已修剪: ${originalCount} -> ${originalBody.messages.length} 条消息`);
+          console.log(
+            `[ContextControl] 上下文已修剪: ${originalCount} -> ${originalBody.messages.length} 条消息`
+          );
         }
       }
     }
@@ -750,29 +935,40 @@ class ChatCompletionHandler {
     try {
       if (originalBody.model) {
         const originalModel = originalBody.model;
-        const isSemanticRoutingModel = semanticModelRouter && typeof semanticModelRouter.isRoutingModel === 'function'
-          ? semanticModelRouter.isRoutingModel(originalModel)
-          : false;
+        const isSemanticRoutingModel =
+          semanticModelRouter &&
+          typeof semanticModelRouter.isRoutingModel === "function"
+            ? semanticModelRouter.isRoutingModel(originalModel)
+            : false;
 
         if (!isSemanticRoutingModel) {
-          const redirectedModel = modelRedirectHandler.redirectModelForBackend(originalModel);
+          const redirectedModel =
+            modelRedirectHandler.redirectModelForBackend(originalModel);
           if (redirectedModel !== originalModel) {
             originalBody = { ...originalBody, model: redirectedModel };
-            console.log(`[ModelRedirect] 客户端请求模型 '${originalModel}' 已重定向为后端模型 '${redirectedModel}'`);
+            console.log(
+              `[ModelRedirect] 客户端请求模型 '${originalModel}' 已重定向为后端模型 '${redirectedModel}'`
+            );
           }
 
           // --- 国产A类模型推理功能控制 (ChinaModel Thinking Control) ---
           applyChinaModelThinkingControl(originalBody);
         } else if (DEBUG_MODE) {
-          console.log(`[SemanticModelRouter] 检测到语义路由模型 '${originalModel}'，延后到消息预处理完成后选择真实后端模型。`);
+          console.log(
+            `[SemanticModelRouter] 检测到语义路由模型 '${originalModel}'，延后到消息预处理完成后选择真实后端模型。`
+          );
         }
       }
 
-      await writeDebugLog('LogInput', originalBody);
+      await writeDebugLog("LogInput", originalBody);
 
-      const vcpToolUseForbidden = consumeVcpToolUseForbiddenPlaceholder(originalBody.messages);
+      const vcpToolUseForbidden = consumeVcpToolUseForbiddenPlaceholder(
+        originalBody.messages
+      );
       if (vcpToolUseForbidden && DEBUG_MODE) {
-        console.log(`[VCPToolUse] Detected ${VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER} in top-level system prompt. Tool parsing/execution is disabled for this request.`);
+        console.log(
+          `[VCPToolUse] Detected ${VCP_TOOL_USE_FORBIDDEN_PLACEHOLDER} in top-level system prompt. Tool parsing/execution is disabled for this request.`
+        );
       }
 
       let shouldProcessMedia = false;
@@ -781,24 +977,24 @@ class ChatCompletionHandler {
         for (const msg of originalBody.messages) {
           let foundPlaceholderInMsg = false;
           let foundPlusPlaceholderInMsg = false;
-          if (msg.role === 'user' || msg.role === 'system') {
-            if (typeof msg.content === 'string') {
-              if (msg.content.includes('{{TransBase64+}}')) {
+          if (msg.role === "user" || msg.role === "system") {
+            if (typeof msg.content === "string") {
+              if (msg.content.includes("{{TransBase64+}}")) {
                 foundPlusPlaceholderInMsg = true;
-                msg.content = msg.content.replace(/\{\{TransBase64\+\}\}/g, '');
-              } else if (msg.content.includes('{{TransBase64}}')) {
+                msg.content = msg.content.replace(/\{\{TransBase64\+\}\}/g, "");
+              } else if (msg.content.includes("{{TransBase64}}")) {
                 foundPlaceholderInMsg = true;
-                msg.content = msg.content.replace(/\{\{TransBase64\}\}/g, '');
+                msg.content = msg.content.replace(/\{\{TransBase64\}\}/g, "");
               }
             } else if (Array.isArray(msg.content)) {
               for (const part of msg.content) {
-                if (part.type === 'text' && typeof part.text === 'string') {
-                  if (part.text.includes('{{TransBase64+}}')) {
+                if (part.type === "text" && typeof part.text === "string") {
+                  if (part.text.includes("{{TransBase64+}}")) {
                     foundPlusPlaceholderInMsg = true;
-                    part.text = part.text.replace(/\{\{TransBase64\+\}\}/g, '');
-                  } else if (part.text.includes('{{TransBase64}}')) {
+                    part.text = part.text.replace(/\{\{TransBase64\+\}\}/g, "");
+                  } else if (part.text.includes("{{TransBase64}}")) {
                     foundPlaceholderInMsg = true;
-                    part.text = part.text.replace(/\{\{TransBase64\}\}/g, '');
+                    part.text = part.text.replace(/\{\{TransBase64\}\}/g, "");
                   }
                 }
               }
@@ -809,7 +1005,14 @@ class ChatCompletionHandler {
             if (foundPlusPlaceholderInMsg) {
               shouldProcessMediaPlus = true;
             }
-            if (DEBUG_MODE) console.log(`[Server] Media translation enabled by ${foundPlusPlaceholderInMsg ? '{{TransBase64+}}' : '{{TransBase64}}'} placeholder.`);
+            if (DEBUG_MODE)
+              console.log(
+                `[Server] Media translation enabled by ${
+                  foundPlusPlaceholderInMsg
+                    ? "{{TransBase64+}}"
+                    : "{{TransBase64}}"
+                } placeholder.`
+              );
             // Removed break to ensure all + modifiers are processed if present in multiple messages
           }
         }
@@ -818,12 +1021,23 @@ class ChatCompletionHandler {
       // --- VCPTavern 优先处理 ---
       // 在任何变量替换之前，首先运行 VCPTavern 来注入预设内容
       let tavernProcessedMessages = originalBody.messages;
-      if (pluginManager.messagePreprocessors.has('VCPTavern')) {
-        if (DEBUG_MODE) console.log(`[Server] Calling priority message preprocessor: VCPTavern`);
+      if (pluginManager.messagePreprocessors.has("VCPTavern")) {
+        if (DEBUG_MODE)
+          console.log(
+            `[Server] Calling priority message preprocessor: VCPTavern`
+          );
         try {
-          tavernProcessedMessages = await pluginManager.executeMessagePreprocessor('VCPTavern', originalBody.messages, requestPreprocessorConfig);
+          tavernProcessedMessages =
+            await pluginManager.executeMessagePreprocessor(
+              "VCPTavern",
+              originalBody.messages,
+              requestPreprocessorConfig
+            );
         } catch (pluginError) {
-          console.error(`[Server] Error in priority preprocessor VCPTavern:`, pluginError);
+          console.error(
+            `[Server] Error in priority preprocessor VCPTavern:`,
+            pluginError
+          );
         }
       }
 
@@ -833,31 +1047,43 @@ class ChatCompletionHandler {
       // 2) 在变量替换前完成，使后续的 SarPrompt、ChinaModel 等模型相关注入能针对真实路由模型生效。
       let semanticRoutePlan = null;
       let semanticModelFallbackCandidates = null;
-      if (semanticModelRouter && typeof semanticModelRouter.isRoutingModel === 'function' && semanticModelRouter.isRoutingModel(originalBody.model)) {
+      if (
+        semanticModelRouter &&
+        typeof semanticModelRouter.isRoutingModel === "function" &&
+        semanticModelRouter.isRoutingModel(originalBody.model)
+      ) {
         semanticRoutePlan = await semanticModelRouter.resolveRoute({
           requestedModel: originalBody.model,
           messages: tavernProcessedMessages,
-          pluginManager
+          pluginManager,
         });
 
         if (semanticRoutePlan && semanticRoutePlan.active) {
-          const rawCandidates = Array.isArray(semanticRoutePlan.candidates) && semanticRoutePlan.candidates.length > 0
-            ? semanticRoutePlan.candidates
-            : [semanticRoutePlan.selectedModel];
+          const rawCandidates =
+            Array.isArray(semanticRoutePlan.candidates) &&
+            semanticRoutePlan.candidates.length > 0
+              ? semanticRoutePlan.candidates
+              : [semanticRoutePlan.selectedModel];
 
           semanticModelFallbackCandidates = rawCandidates
-            .map(model => modelRedirectHandler.redirectModelForBackend(model))
+            .map((model) => modelRedirectHandler.redirectModelForBackend(model))
             .filter(Boolean)
             .filter((model, index, arr) => arr.indexOf(model) === index);
 
-          const selectedBackendModel = semanticModelFallbackCandidates[0] || modelRedirectHandler.redirectModelForBackend(semanticRoutePlan.selectedModel);
+          const selectedBackendModel =
+            semanticModelFallbackCandidates[0] ||
+            modelRedirectHandler.redirectModelForBackend(
+              semanticRoutePlan.selectedModel
+            );
           const previousModel = originalBody.model;
           originalBody = { ...originalBody, model: selectedBackendModel };
 
           if (DEBUG_MODE || previousModel !== selectedBackendModel) {
             console.log(
               `[SemanticModelRouter] 请求模型 '${previousModel}' 已路由到 '${selectedBackendModel}' ` +
-              `(preset=${semanticRoutePlan.presetName}, reason=${semanticRoutePlan.reason}, candidates=${semanticModelFallbackCandidates.join(' -> ')})`
+                `(preset=${semanticRoutePlan.presetName}, reason=${
+                  semanticRoutePlan.reason
+                }, candidates=${semanticModelFallbackCandidates.join(" -> ")})`
             );
           }
 
@@ -877,8 +1103,8 @@ class ChatCompletionHandler {
         // 🔒 灵魂级占位符去重：跨消息共享展开状态
         // Agent 类：整个上下文只允许展开一个 agent（第一个遇到的），后续所有 agent 占位符均不展开
         // Toolbox 类：每种 toolbox 各允许展开一次，同名重复出现时不再展开
-        expandedAgentName: null,    // string | null - 已展开的唯一 Agent 别名
-        expandedToolboxes: new Set() // Set<string> - 已展开的 Toolbox 别名集合
+        expandedAgentName: null, // string | null - 已展开的唯一 Agent 别名
+        expandedToolboxes: new Set(), // Set<string> - 已展开的 Toolbox 别名集合
       };
 
       // 🔒 顺序处理消息（非并发），确保 agent/toolbox 的"首次展开"语义正确
@@ -886,23 +1112,23 @@ class ChatCompletionHandler {
       let processedMessages = [];
       for (const msg of tavernProcessedMessages) {
         const newMessage = JSON.parse(JSON.stringify(msg));
-        if (newMessage.content && typeof newMessage.content === 'string') {
+        if (newMessage.content && typeof newMessage.content === "string") {
           newMessage.content = await messageProcessor.replaceAgentVariables(
             newMessage.content,
             originalBody.model,
             msg.role,
-            processingContext,
+            processingContext
           );
         } else if (Array.isArray(newMessage.content)) {
           const newParts = [];
           for (const part of newMessage.content) {
-            if (part.type === 'text' && typeof part.text === 'string') {
+            if (part.type === "text" && typeof part.text === "string") {
               const newPart = JSON.parse(JSON.stringify(part));
               newPart.text = await messageProcessor.replaceAgentVariables(
                 newPart.text,
                 originalBody.model,
                 msg.role,
-                processingContext,
+                processingContext
               );
               newParts.push(newPart);
             } else {
@@ -913,30 +1139,53 @@ class ChatCompletionHandler {
         }
         processedMessages.push(newMessage);
       }
-      if (DEBUG_MODE) await writeDebugLog('LogAfterVariableProcessing', processedMessages);
+      if (DEBUG_MODE)
+        await writeDebugLog("LogAfterVariableProcessing", processedMessages);
 
       // --- 媒体处理器 ---
       if (shouldProcessMedia) {
         if (shouldProcessMediaPlus) {
           for (const msg of processedMessages) {
-            if (msg.role === 'user' && Array.isArray(msg.content)) {
-              const mediaParts = msg.content.filter(part => part.type === 'image_url' && part.image_url && typeof part.image_url.url === 'string' && /^data:(image|audio|video)\/[^;]+;base64,/.test(part.image_url.url));
+            if (msg.role === "user" && Array.isArray(msg.content)) {
+              const mediaParts = msg.content.filter(
+                (part) =>
+                  part.type === "image_url" &&
+                  part.image_url &&
+                  typeof part.image_url.url === "string" &&
+                  /^data:(image|audio|video)\/[^;]+;base64,/.test(
+                    part.image_url.url
+                  )
+              );
               if (mediaParts.length > 0) {
-                msg.__vcp_media_backup__ = JSON.parse(JSON.stringify(mediaParts));
+                msg.__vcp_media_backup__ = JSON.parse(
+                  JSON.stringify(mediaParts)
+                );
               }
             }
           }
         }
 
-        const processorName = pluginManager.messagePreprocessors.has('MultiModalProcessor')
-          ? 'MultiModalProcessor'
-          : 'ImageProcessor';
+        const processorName = pluginManager.messagePreprocessors.has(
+          "MultiModalProcessor"
+        )
+          ? "MultiModalProcessor"
+          : "ImageProcessor";
         if (pluginManager.messagePreprocessors.has(processorName)) {
-          if (DEBUG_MODE) console.log(`[Server] Calling message preprocessor: ${processorName}`);
+          if (DEBUG_MODE)
+            console.log(
+              `[Server] Calling message preprocessor: ${processorName}`
+            );
           try {
-            processedMessages = await pluginManager.executeMessagePreprocessor(processorName, processedMessages, requestPreprocessorConfig);
+            processedMessages = await pluginManager.executeMessagePreprocessor(
+              processorName,
+              processedMessages,
+              requestPreprocessorConfig
+            );
           } catch (pluginError) {
-            console.error(`[Server] Error in preprocessor ${processorName}:`, pluginError);
+            console.error(
+              `[Server] Error in preprocessor ${processorName}:`,
+              pluginError
+            );
           }
         }
       }
@@ -944,50 +1193,67 @@ class ChatCompletionHandler {
       // --- 其他通用消息预处理器 ---
       for (const name of pluginManager.messagePreprocessors.keys()) {
         // 跳过已经特殊处理的插件
-        if (name === 'ImageProcessor' || name === 'MultiModalProcessor' || name === 'VCPTavern') continue;
+        if (
+          name === "ImageProcessor" ||
+          name === "MultiModalProcessor" ||
+          name === "VCPTavern"
+        )
+          continue;
 
-        if (DEBUG_MODE) console.log(`[Server] Calling message preprocessor: ${name}`);
+        if (DEBUG_MODE)
+          console.log(`[Server] Calling message preprocessor: ${name}`);
         try {
-          processedMessages = await pluginManager.executeMessagePreprocessor(name, processedMessages, requestPreprocessorConfig);
+          processedMessages = await pluginManager.executeMessagePreprocessor(
+            name,
+            processedMessages,
+            requestPreprocessorConfig
+          );
         } catch (pluginError) {
           console.error(`[Server] Error in preprocessor ${name}:`, pluginError);
         }
       }
-      if (DEBUG_MODE) await writeDebugLog('LogAfterPreprocessors', processedMessages);
+      if (DEBUG_MODE)
+        await writeDebugLog("LogAfterPreprocessors", processedMessages);
 
       // --- TransBase64+ Cleanup & Restore ---
       if (shouldProcessMediaPlus) {
         for (const msg of processedMessages) {
-          if (msg.role === 'user') {
+          if (msg.role === "user") {
             // Remove the info block
-            if (typeof msg.content === 'string') {
-              msg.content = msg.content.replace(/<VCP_MULTIMODAL_INFO>[\s\S]*?<\/VCP_MULTIMODAL_INFO>/g, '');
+            if (typeof msg.content === "string") {
+              msg.content = msg.content.replace(
+                /<VCP_MULTIMODAL_INFO>[\s\S]*?<\/VCP_MULTIMODAL_INFO>/g,
+                ""
+              );
             } else if (Array.isArray(msg.content)) {
               for (const part of msg.content) {
-                if (part.type === 'text' && typeof part.text === 'string') {
-                  part.text = part.text.replace(/<VCP_MULTIMODAL_INFO>[\s\S]*?<\/VCP_MULTIMODAL_INFO>/g, '');
+                if (part.type === "text" && typeof part.text === "string") {
+                  part.text = part.text.replace(
+                    /<VCP_MULTIMODAL_INFO>[\s\S]*?<\/VCP_MULTIMODAL_INFO>/g,
+                    ""
+                  );
                 }
               }
             }
 
             // Restore the backup
             if (msg.__vcp_media_backup__) {
-              if (typeof msg.content === 'string') {
+              if (typeof msg.content === "string") {
                 msg.content = [
-                  { type: 'text', text: msg.content },
-                  ...msg.__vcp_media_backup__
+                  { type: "text", text: msg.content },
+                  ...msg.__vcp_media_backup__,
                 ];
               } else if (Array.isArray(msg.content)) {
-                msg.content = [
-                  ...msg.content,
-                  ...msg.__vcp_media_backup__
-                ];
+                msg.content = [...msg.content, ...msg.__vcp_media_backup__];
               }
               delete msg.__vcp_media_backup__;
             }
           }
         }
-        if (DEBUG_MODE) console.log(`[Server] TransBase64+ cleanup and media restore complete.`);
+        if (DEBUG_MODE)
+          console.log(
+            `[Server] TransBase64+ cleanup and media restore complete.`
+          );
       }
 
       // --- Detector / SuperDetector 后置处理 ---
@@ -997,22 +1263,30 @@ class ChatCompletionHandler {
       const messagesBeforeDetectors = processedMessages;
       processedMessages = copyArrayMetadata(
         messagesBeforeDetectors,
-        messageProcessor.applyDetectorsToMessages(processedMessages, processingContext)
+        messageProcessor.applyDetectorsToMessages(
+          processedMessages,
+          processingContext
+        )
       );
-      if (DEBUG_MODE) await writeDebugLog('LogAfterDetectors', processedMessages);
+      if (DEBUG_MODE)
+        await writeDebugLog("LogAfterDetectors", processedMessages);
 
       // --- 角色分割处理 (Role Divider) - 最终阶段 ---
       if (enableRoleDivider) {
-        if (DEBUG_MODE) console.log('[Server] Applying Role Divider processing (Final Stage)...');
+        if (DEBUG_MODE)
+          console.log(
+            "[Server] Applying Role Divider processing (Final Stage)..."
+          );
         // skipCount: 1 to exclude the initial SystemPrompt from splitting
         processedMessages = roleDivider.process(processedMessages, {
           ignoreList: roleDividerIgnoreList,
           switches: roleDividerSwitches,
           scanSwitches: roleDividerScanSwitches,
           removeDisabledTags: roleDividerRemoveDisabledTags,
-          skipCount: 1
+          skipCount: 1,
         });
-        if (DEBUG_MODE) await writeDebugLog('LogAfterFinalRoleDivider', processedMessages);
+        if (DEBUG_MODE)
+          await writeDebugLog("LogAfterFinalRoleDivider", processedMessages);
       }
 
       // 经过改造后，processedMessages 已经是最终版本，无需再调用 replaceOtherVariables
@@ -1021,15 +1295,29 @@ class ChatCompletionHandler {
 
       let oneRingResponseMeta = null;
       try {
-        const oneRingModule = pluginManager?.messagePreprocessors?.get?.('OneRing');
-        if (oneRingModule && typeof oneRingModule.extractMetaFromMessages === 'function') {
-          oneRingResponseMeta = oneRingModule.extractMetaFromMessages(processedMessages);
+        const oneRingModule =
+          pluginManager?.messagePreprocessors?.get?.("OneRing");
+        if (
+          oneRingModule &&
+          typeof oneRingModule.extractMetaFromMessages === "function"
+        ) {
+          oneRingResponseMeta =
+            oneRingModule.extractMetaFromMessages(processedMessages);
           if (DEBUG_MODE && oneRingResponseMeta) {
-            console.log(`[OneRing] Frozen response meta before upstream fetch: agent=${oneRingResponseMeta.agentName} frontend=${oneRingResponseMeta.frontendSource} turn=${oneRingResponseMeta.turnId || 'none'}`);
+            console.log(
+              `[OneRing] Frozen response meta before upstream fetch: agent=${
+                oneRingResponseMeta.agentName
+              } frontend=${oneRingResponseMeta.frontendSource} turn=${
+                oneRingResponseMeta.turnId || "none"
+              }`
+            );
           }
         }
       } catch (oneRingMetaError) {
-        console.warn('[OneRing] Failed to freeze response meta before upstream fetch:', oneRingMetaError.message);
+        console.warn(
+          "[OneRing] Failed to freeze response meta before upstream fetch:",
+          oneRingMetaError.message
+        );
       }
 
       const willStreamResponse = isOriginalRequestStreaming;
@@ -1040,20 +1328,24 @@ class ChatCompletionHandler {
         messageId: req.body.messageId || null,
         clientIp,
         forceShowVCP,
-        capturedStage: 'before_upstream_fetch'
+        capturedStage: "before_upstream_fetch",
       });
 
-      await writeDebugLog('LogOutputAfterProcessing', finalUpstreamBody);
+      await writeDebugLog("LogOutputAfterProcessing", finalUpstreamBody);
 
       let firstAiAPIResponse = await fetchWithRetry(
         `${apiUrl}/v1/chat/completions`,
         {
-          method: 'POST',
+          method: "POST",
           headers: {
-            'Content-Type': 'application/json',
+            "Content-Type": "application/json",
             Authorization: `Bearer ${apiKey}`,
-            ...(req.headers['user-agent'] && { 'User-Agent': req.headers['user-agent'] }),
-            Accept: willStreamResponse ? 'text/event-stream' : req.headers['accept'] || 'application/json',
+            ...(req.headers["user-agent"] && {
+              "User-Agent": req.headers["user-agent"],
+            }),
+            Accept: willStreamResponse
+              ? "text/event-stream"
+              : req.headers["accept"] || "application/json",
           },
           body: JSON.stringify(finalUpstreamBody),
           signal: abortController.signal,
@@ -1062,22 +1354,28 @@ class ChatCompletionHandler {
           retries: apiRetries,
           delay: apiRetryDelay,
           debugMode: DEBUG_MODE,
+          connectionTimeout: 600000, // 10 分钟，适应 Claude extended thinking 等长推理模型（默认 120s 过短导致 client_gone）
           modelFallbackCandidates: semanticModelFallbackCandidates,
           onRetry: async (attempt, errorInfo) => {
             if (!res.headersSent && isOriginalRequestStreaming) {
               if (DEBUG_MODE)
-                console.log(`[VCP Retry] First retry attempt (#${attempt}). Sending 200 OK to client to establish stream.`);
+                console.log(
+                  `[VCP Retry] First retry attempt (#${attempt}). Sending 200 OK to client to establish stream.`
+                );
               res.status(200);
-              res.setHeader('Content-Type', 'text/event-stream');
-              res.setHeader('Cache-Control', 'no-cache');
-              res.setHeader('Connection', 'keep-alive');
+              res.setHeader("Content-Type", "text/event-stream");
+              res.setHeader("Cache-Control", "no-cache");
+              res.setHeader("Connection", "keep-alive");
             }
           },
-        },
+        }
       );
 
       const isUpstreamStreaming =
-        willStreamResponse && firstAiAPIResponse.headers.get('content-type')?.includes('text/event-stream');
+        willStreamResponse &&
+        firstAiAPIResponse.headers
+          .get("content-type")
+          ?.includes("text/event-stream");
 
       if (!res.headersSent) {
         const upstreamStatus = firstAiAPIResponse.status;
@@ -1086,15 +1384,17 @@ class ChatCompletionHandler {
           // If streaming was requested, but upstream returned a non-200 status (e.g., 400, 401, 502, 504),
           // we must return 200 OK and stream the error as an SSE chunk to prevent client listener termination.
           res.status(200);
-          res.setHeader('Content-Type', 'text/event-stream');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
+          res.setHeader("Content-Type", "text/event-stream");
+          res.setHeader("Cache-Control", "no-cache");
+          res.setHeader("Connection", "keep-alive");
 
           // Read the error body from the upstream response
           const errorBodyText = await firstAiAPIResponse.text();
 
           // Log the error
-          console.error(`[Upstream Error Stream Proxy] Upstream API returned status ${upstreamStatus}. Streaming error to client: ${errorBodyText}`);
+          console.error(
+            `[Upstream Error Stream Proxy] Upstream API returned status ${upstreamStatus}. Streaming error to client: ${errorBodyText}`
+          );
 
           // Construct the error message for the client
           const errorContent = `[UPSTREAM_ERROR] 上游API返回状态码 ${upstreamStatus}，错误信息: ${errorBodyText}`;
@@ -1102,41 +1402,52 @@ class ChatCompletionHandler {
           // Send an error chunk
           const errorPayload = {
             id: `chatcmpl-VCP-upstream-error-${Date.now()}`,
-            object: 'chat.completion.chunk',
+            object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
-            model: originalBody.model || 'unknown',
+            model: originalBody.model || "unknown",
             choices: [
               {
                 index: 0,
                 delta: {
                   content: errorContent,
                 },
-                finish_reason: 'stop',
+                finish_reason: "stop",
               },
             ],
           };
           try {
             res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
-            res.write('data: [DONE]\n\n', () => {
+            res.write("data: [DONE]\n\n", () => {
               res.end();
             });
           } catch (writeError) {
-            console.error('[Upstream Error] Failed to write error to stream:', writeError.message);
+            console.error(
+              "[Upstream Error] Failed to write error to stream:",
+              writeError.message
+            );
             if (!res.writableEnded) {
               try {
                 res.end();
               } catch (endError) {
-                console.error('[Upstream Error] Failed to end response:', endError.message);
+                console.error(
+                  "[Upstream Error] Failed to end response:",
+                  endError.message
+                );
               }
             }
           }
 
           if (writeChatLog) {
-            writeChatLog(originalBody,
-              [ {
+            writeChatLog(originalBody, [
+              {
                 request: originalBody,
-                response: { error: true, status: upstreamStatus, body: errorBodyText }
-              } ]);
+                response: {
+                  error: true,
+                  status: upstreamStatus,
+                  body: errorBodyText,
+                },
+              },
+            ]);
           }
           // We are done with this request. Return early.
           return;
@@ -1146,17 +1457,26 @@ class ChatCompletionHandler {
         res.status(upstreamStatus);
         firstAiAPIResponse.headers.forEach((value, name) => {
           if (
-            !['content-encoding', 'transfer-encoding', 'connection', 'content-length', 'keep-alive'].includes(
-              name.toLowerCase(),
-            )
+            ![
+              "content-encoding",
+              "transfer-encoding",
+              "connection",
+              "content-length",
+              "keep-alive",
+            ].includes(name.toLowerCase())
           ) {
             res.setHeader(name, value);
           }
         });
-        if (isOriginalRequestStreaming && !res.getHeader('Content-Type')?.includes('text/event-stream')) {
-          res.setHeader('Content-Type', 'text/event-stream');
-          if (!res.getHeader('Cache-Control')) res.setHeader('Cache-Control', 'no-cache');
-          if (!res.getHeader('Connection')) res.setHeader('Connection', 'keep-alive');
+        if (
+          isOriginalRequestStreaming &&
+          !res.getHeader("Content-Type")?.includes("text/event-stream")
+        ) {
+          res.setHeader("Content-Type", "text/event-stream");
+          if (!res.getHeader("Cache-Control"))
+            res.setHeader("Cache-Control", "no-cache");
+          if (!res.getHeader("Connection"))
+            res.setHeader("Connection", "keep-alive");
         }
       }
 
@@ -1174,96 +1494,120 @@ class ChatCompletionHandler {
         formatToolResult,
         vcpToolUseForbidden,
         semanticModelFallbackCandidates,
-        oneRingResponseMeta
+        oneRingResponseMeta,
       };
 
       if (isUpstreamStreaming) {
         await new StreamHandler(context).handle(req, res, firstAiAPIResponse);
       } else {
-        await new NonStreamHandler(context).handle(req, res, firstAiAPIResponse);
+        await new NonStreamHandler(context).handle(
+          req,
+          res,
+          firstAiAPIResponse
+        );
       }
     } catch (error) {
-      if (error.name === 'AbortError') {
+      if (error.name === "AbortError") {
         // 显式 /v1/interrupt 或客户端断联都会走到这里。
         // 如果是客户端断联，响应通道通常已经不可写；如果是显式 interrupt，则由 interrupt 路由负责关闭响应流。
         // 这里仅停止后续处理，避免与中止链路竞态写入。
-        const abortReason = clientDisconnectedAbortReason || activeRequests.get(id)?.abortReason || 'explicit_interrupt_or_abort';
-        console.log(`[Abort] Caught AbortError for request ${id}. Execution halted. reason=${abortReason}`);
+        const abortReason =
+          clientDisconnectedAbortReason ||
+          activeRequests.get(id)?.abortReason ||
+          "explicit_interrupt_or_abort";
+        console.log(
+          `[Abort] Caught AbortError for request ${id}. Execution halted. reason=${abortReason}`
+        );
         return; // Stop processing and allow the 'finally' block to clean up.
       }
       // Only log full stack trace for non-abort errors
-      console.error('处理请求或转发时出错:', error.message, error.stack);
+      console.error("处理请求或转发时出错:", error.message, error.stack);
 
       if (!res.headersSent) {
         if (isOriginalRequestStreaming) {
           // If streaming was requested but failed before headers were sent (e.g., fetchWithRetry failed),
           // send a 200 status and communicate the error via SSE chunks to prevent the client from stopping listening.
           res.status(200);
-          res.setHeader('Content-Type', 'text/event-stream');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
+          res.setHeader("Content-Type", "text/event-stream");
+          res.setHeader("Cache-Control", "no-cache");
+          res.setHeader("Connection", "keep-alive");
 
           const errorContent = `[ERROR] 代理服务器在连接上游API时失败，可能已达到重试上限或网络错误: ${error.message}`;
 
           // Send an error chunk
           const errorPayload = {
             id: `chatcmpl-VCP-error-${Date.now()}`,
-            object: 'chat.completion.chunk',
+            object: "chat.completion.chunk",
             created: Math.floor(Date.now() / 1000),
-            model: originalBody.model || 'unknown',
+            model: originalBody.model || "unknown",
             choices: [
               {
                 index: 0,
                 delta: {
                   content: errorContent,
                 },
-                finish_reason: 'stop',
+                finish_reason: "stop",
               },
             ],
           };
           try {
             res.write(`data: ${JSON.stringify(errorPayload)}\n\n`);
-            res.write('data: [DONE]\n\n', () => {
+            res.write("data: [DONE]\n\n", () => {
               res.end();
             });
           } catch (writeError) {
-            console.error('[Error Handler Stream] Failed to write error:', writeError.message);
+            console.error(
+              "[Error Handler Stream] Failed to write error:",
+              writeError.message
+            );
             if (!res.writableEnded && !res.destroyed) {
               try {
                 res.end();
               } catch (endError) {
-                console.error('[Error Handler Stream] Failed to end response:', endError.message);
+                console.error(
+                  "[Error Handler Stream] Failed to end response:",
+                  endError.message
+                );
               }
             }
           }
         } else {
           // Non-streaming failure
-          res.status(500).json({ error: 'Internal Server Error', details: error.message });
+          res
+            .status(500)
+            .json({ error: "Internal Server Error", details: error.message });
         }
         if (writeChatLog) {
-          writeChatLog(originalBody,
-            [ {
+          writeChatLog(originalBody, [
+            {
               request: originalBody,
-              response: { error: true, message: error.message }
-            } ]);
+              response: { error: true, message: error.message },
+            },
+          ]);
         }
       } else if (!res.writableEnded) {
         // Headers already sent (error during streaming loop)
         console.error(
-          '[STREAM ERROR] Headers already sent. Cannot send JSON error. Ending stream if not already ended.',
+          "[STREAM ERROR] Headers already sent. Cannot send JSON error. Ending stream if not already ended."
         );
         // Send [DONE] marker before ending the stream for graceful termination
         try {
-          res.write('data: [DONE]\n\n', () => {
+          res.write("data: [DONE]\n\n", () => {
             res.end();
           });
         } catch (writeError) {
-          console.error('[Error Handler Stream Cleanup] Failed to write [DONE]:', writeError.message);
+          console.error(
+            "[Error Handler Stream Cleanup] Failed to write [DONE]:",
+            writeError.message
+          );
           if (!res.writableEnded && !res.destroyed) {
             try {
               res.end();
             } catch (endError) {
-              console.error('[Error Handler Stream Cleanup] Failed to end response:', endError.message);
+              console.error(
+                "[Error Handler Stream Cleanup] Failed to end response:",
+                endError.message
+              );
             }
           }
         }
@@ -1285,10 +1629,14 @@ class ChatCompletionHandler {
           // 🟢 修复：不再在 finally 块中盲目 abort
           // 只有在客户端连接已断开（res.destroyed）且请求未正常结束时才中止上游
           // 这防止了在模型输出异常（如潜空间坍缩）导致处理逻辑快速结束时，服务器误杀上游连接
-          if (!requestData.aborted && requestData.abortController && !requestData.abortController.signal.aborted) {
+          if (
+            !requestData.aborted &&
+            requestData.abortController &&
+            !requestData.abortController.signal.aborted
+          ) {
             if (res.destroyed && !res.writableEnded) {
               requestData.aborted = true;
-              requestData.abortReason = 'response_destroyed_in_finally';
+              requestData.abortReason = "response_destroyed_in_finally";
               requestData.abortController.abort();
             }
           }
@@ -1297,7 +1645,10 @@ class ChatCompletionHandler {
           // 但使用 setImmediate 延迟删除，确保 interrupt 路由完成操作
           setImmediate(() => {
             activeRequests.delete(id);
-            if (DEBUG_MODE) console.log(`[ChatHandler Cleanup] Removed request ${id} from activeRequests.`);
+            if (DEBUG_MODE)
+              console.log(
+                `[ChatHandler Cleanup] Removed request ${id} from activeRequests.`
+              );
           });
         }
       }
