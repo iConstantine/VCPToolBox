@@ -17,23 +17,58 @@ const { ServerInferredTimelineStrategy } = require('./OneRingServerInferredTimel
 const TRIGGER_REGEX = /\[\[OneRing::([^:]+?)::([^:\]]+?)(?:::([^\]]+?))?\]\]/;
 const TRIGGER_GLOBAL_REGEX = /\[\[OneRing::([^:]+?)::([^:\]]+?)(?:::([^\]]+?))?\]\]/g;
 const ONLY_TRIGGER_GLOBAL_REGEX = /\[\[OneRing::Only\]\]/gi;
+const VCP_RAG_BLOCK_REGEX = /<!--\s*VCP_RAG_BLOCK_START\b[\s\S]*?<!--\s*VCP_RAG_BLOCK_END\s*-->/gi;
+
+function stripVcpRagBlocks(text) {
+    return typeof text === 'string' ? text.replace(VCP_RAG_BLOCK_REGEX, '') : text;
+}
+
+function getVcpRagBlockRanges(text) {
+    if (typeof text !== 'string') return [];
+    const ranges = [];
+    const re = new RegExp(VCP_RAG_BLOCK_REGEX.source, VCP_RAG_BLOCK_REGEX.flags);
+    let match;
+    while ((match = re.exec(text)) !== null) {
+        ranges.push({ start: match.index, end: match.index + match[0].length });
+    }
+    return ranges;
+}
+
+function overlapsAnyRange(start, end, ranges) {
+    return ranges.some(range => start < range.end && end > range.start);
+}
+
+function replaceLastOccurrenceOutsideVcpRagBlocks(text, search, replacement) {
+    if (typeof text !== 'string' || !search) return text;
+    const ranges = getVcpRagBlockRanges(text);
+    let idx = text.lastIndexOf(search);
+    while (idx >= 0) {
+        const end = idx + search.length;
+        if (!overlapsAnyRange(idx, end, ranges)) {
+            return text.slice(0, idx) + replacement + text.slice(end);
+        }
+        idx = text.lastIndexOf(search, idx - 1);
+    }
+    return text;
+}
 
 function getLastTriggerMatch(systemText) {
     if (typeof systemText !== 'string') return null;
-    const matches = [...systemText.matchAll(TRIGGER_GLOBAL_REGEX)];
+    const matches = [...stripVcpRagBlocks(systemText).matchAll(TRIGGER_GLOBAL_REGEX)];
     if (matches.length === 0) return null;
     return matches[matches.length - 1];
 }
 
 function getLastOnlyTriggerMatch(systemText) {
     if (typeof systemText !== 'string') return null;
-    const matches = [...systemText.matchAll(ONLY_TRIGGER_GLOBAL_REGEX)];
+    const matches = [...stripVcpRagBlocks(systemText).matchAll(ONLY_TRIGGER_GLOBAL_REGEX)];
     if (matches.length === 0) return null;
     return matches[matches.length - 1];
 }
 
 function getLastNoticeMeta(systemText) {
     if (typeof systemText !== 'string') return null;
+    systemText = stripVcpRagBlocks(systemText);
 
     // 完整通知格式：
     // [OneRing系统已启动，当前Agent小吉，当前客户端VCPChat，所有上下文OneRing信息来源标记由系统生成无需你自动输出。]
@@ -412,7 +447,7 @@ function replaceTriggerWithNotice(content, triggerText, agentName, frontendSourc
     const notice = `[OneRing系统已启动，当前Agent${agentName}，当前客户端${frontendSource}${modeNotice}，所有上下文OneRing信息来源标记由系统生成无需你自动输出。]`;
 
     if (typeof content === 'string') {
-        return replaceLastOccurrence(content, triggerText, notice);
+        return replaceLastOccurrenceOutsideVcpRagBlocks(content, triggerText, notice);
     }
 
     if (Array.isArray(content)) {
@@ -425,7 +460,7 @@ function replaceTriggerWithNotice(content, triggerText, agentName, frontendSourc
                 typeof part.text === 'string' &&
                 part.text.includes(triggerText)
             ) {
-                result[i] = { ...part, text: replaceLastOccurrence(part.text, triggerText, notice) };
+                result[i] = { ...part, text: replaceLastOccurrenceOutsideVcpRagBlocks(part.text, triggerText, notice) };
                 return result;
             }
         }
@@ -433,7 +468,7 @@ function replaceTriggerWithNotice(content, triggerText, agentName, frontendSourc
     }
 
     if (content && typeof content === 'object' && typeof content.text === 'string') {
-        return { ...content, text: replaceLastOccurrence(content.text, triggerText, notice) };
+        return { ...content, text: replaceLastOccurrenceOutsideVcpRagBlocks(content.text, triggerText, notice) };
     }
 
     return content;
@@ -443,7 +478,7 @@ function replaceOnlyTriggerWithNotice(content, triggerText) {
     const notice = '[OneRing Only模式已启动：本次只入库/标记，不做跨端上下文追加。]';
 
     if (typeof content === 'string') {
-        return replaceLastOccurrence(content, triggerText, notice);
+        return replaceLastOccurrenceOutsideVcpRagBlocks(content, triggerText, notice);
     }
 
     if (Array.isArray(content)) {
@@ -456,7 +491,7 @@ function replaceOnlyTriggerWithNotice(content, triggerText) {
                 typeof part.text === 'string' &&
                 part.text.includes(triggerText)
             ) {
-                result[i] = { ...part, text: replaceLastOccurrence(part.text, triggerText, notice) };
+                result[i] = { ...part, text: replaceLastOccurrenceOutsideVcpRagBlocks(part.text, triggerText, notice) };
                 return result;
             }
         }
@@ -464,7 +499,7 @@ function replaceOnlyTriggerWithNotice(content, triggerText) {
     }
 
     if (content && typeof content === 'object' && typeof content.text === 'string') {
-        return { ...content, text: replaceLastOccurrence(content.text, triggerText, notice) };
+        return { ...content, text: replaceLastOccurrenceOutsideVcpRagBlocks(content.text, triggerText, notice) };
     }
 
     return content;
@@ -1068,7 +1103,7 @@ class OneRingPreprocessor {
             // 注意：长上下文无匹配时不补充；只有短新 user 场景可以尝试接入同 Agent 既有时间线。
             if (dbBlocks.length === 0 && historyBlocks.length <= 4) {
                 isFreshShortContext = true;
-                const newConversationStartUserIndex = this._detectNewConversationStartUserIndex(messages, defaultUserName, agentName);
+                const newConversationStartUserIndex = this._detectNewConversationStartUserIndexForTimeline(messages, defaultUserName, agentName, hasClientTimestampTruth);
                 const freshStats = this._recordFreshShortContext(agentName, frontendSource, defaultUserName, historyBlocks, threshold, newConversationStartUserIndex);
                 summaryStats.dbInserted += freshStats.inserted || 0;
                 summaryStats.dbUpdated += freshStats.updated || 0;
@@ -1089,7 +1124,7 @@ class OneRingPreprocessor {
         // 下一轮前端带回来的 assistant 历史可能没有 OneRing 标记，因此这里必须补标。
         const nextTimestamp = createOneRingTimestampSequencer();
         const now = nextTimestamp();
-        const newConversationStartUserIndex = this._detectNewConversationStartUserIndex(messages, defaultUserName, agentName);
+        const newConversationStartUserIndex = this._detectNewConversationStartUserIndexForTimeline(messages, defaultUserName, agentName, hasClientTimestampTruth);
 
         // 入库必须以“实际 post 传入的上下文”为真相；
         // DB 补齐必须在 post 本体写库/补标之后进行，否则前端不回传 OneRing 时间戳时，
@@ -1809,6 +1844,26 @@ class OneRingPreprocessor {
         return effectiveBlocks[0].index;
     }
 
+    _detectFirstUserIndexForClientHashTimeline(messages, defaultUserName, agentName) {
+        if (!Array.isArray(messages)) return -1;
+
+        for (let i = 0; i < messages.length; i++) {
+            const message = messages[i];
+            if (!message || message.role !== 'user') continue;
+
+            const classified = classifyUserContent(message.content, defaultUserName, agentName);
+            if (classified) return i;
+        }
+
+        return -1;
+    }
+
+    _detectNewConversationStartUserIndexForTimeline(messages, defaultUserName, agentName, hasClientTimestampTruth = false) {
+        return hasClientTimestampTruth
+            ? this._detectFirstUserIndexForClientHashTimeline(messages, defaultUserName, agentName)
+            : this._detectNewConversationStartUserIndex(messages, defaultUserName, agentName);
+    }
+
     _createPostRequestHash(postBlocks) {
         const normalizedBlocks = (Array.isArray(postBlocks) ? postBlocks : []).map(block => ({
             role: block.role,
@@ -2063,6 +2118,12 @@ class OneRingPreprocessor {
                 'only-client-verified-hash'
             );
         if (clientTimestampBindings.verifiedBindings.length > 0) {
+            const newConversationStartUserIndex = this._detectNewConversationStartUserIndexForTimeline(
+                result,
+                defaultUserName,
+                agentName,
+                timelineStrategy.hasClientTimestampTruth
+            );
             const timestamped = this._markTimelineBindings(
                 result,
                 result,
@@ -2070,14 +2131,14 @@ class OneRingPreprocessor {
                 defaultUserName,
                 agentName,
                 frontendSource,
-                this._detectNewConversationStartUserIndex(result, defaultUserName, agentName)
+                newConversationStartUserIndex
             );
             result = this._upsertTimelineTailTags(
                 timestamped,
                 defaultUserName,
                 agentName,
                 frontendSource,
-                this._detectNewConversationStartUserIndex(result, defaultUserName, agentName)
+                newConversationStartUserIndex
             );
             timelineStrategy.scheduleTimestampCorrections?.(agentName, frontendSource, clientTimestampBindings.verifiedBindings, 'only-client-hash');
         }
@@ -2210,7 +2271,7 @@ class OneRingPreprocessor {
         }
         timing.mark('snapshotApply', `edited=${summaryStats.snapshotEdited}`);
 
-        const newConversationStartUserIndex = this._detectNewConversationStartUserIndex(result, defaultUserName, agentName);
+        const newConversationStartUserIndex = this._detectNewConversationStartUserIndexForTimeline(result, defaultUserName, agentName, timelineStrategy.hasClientTimestampTruth);
         let syncStats = null;
         try {
             const appendResult = snapshot.detectSnapshotAppend(

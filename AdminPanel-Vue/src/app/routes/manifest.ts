@@ -21,6 +21,7 @@ export type AppRouteId =
   | "vcptavern-editor"
   | "agent-files-editor"
   | "agent-assistant-config"
+  | "agent-emotion-manager"
   | "forum-assistant-config"
   | "agent-scores"
   | "toolbox-manager"
@@ -36,6 +37,7 @@ export type AppRouteId =
   | "server-log-viewer"
   | "semantic-model-router-editor"
   | "final-context-viewer"
+  | "bridge-hijack-config"
   | "placeholder-viewer"
   | "plugins"
   | "plugin-store"
@@ -129,6 +131,16 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     navGroup: "core",
     showInSidebar: true,
   },
+  {
+    id: "bridge-hijack-config",
+    routeName: "BridgeHijackConfig",
+    path: "/bridge-hijack-config",
+    title: "前端劫持配置",
+    icon: "settings_input_component",
+    requiresAuth: true,
+    navGroup: "core",
+    showInSidebar: true,
+  },
   // ── Agent & 内容 ──
   {
     id: "agent-files-editor",
@@ -146,6 +158,16 @@ export const APP_ROUTE_MANIFEST: readonly AppRouteMeta[] = [
     path: "/agent-assistant-config",
     title: "Agent 通讯配置",
     icon: "diversity_3",
+    requiresAuth: true,
+    navGroup: "agentContent",
+    showInSidebar: true,
+  },
+  {
+    id: "agent-emotion-manager",
+    routeName: "AgentEmotionManager",
+    path: "/agent-emotion-manager",
+    title: "Agent 情绪管理",
+    icon: "neurology",
     requiresAuth: true,
     navGroup: "agentContent",
     showInSidebar: true,

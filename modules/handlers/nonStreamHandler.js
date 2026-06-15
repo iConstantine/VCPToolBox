@@ -305,10 +305,53 @@ class NonStreamHandler {
 
         // VCP 信息展示 - 批量包裹为单个 USER 角色
         let hasStartedUserBlock = false;
+        const toolStatusSummaryItems = [];
         for (let i = 0; i < normalCalls.length; i++) {
           const toolCall = normalCalls[i];
           const result = toolResults[i];
           const forceThisOne = !shouldShowVCP && toolCall.markHistory;
+          const isError =
+            !result?.success ||
+            (result?.raw && this.context.isToolResultError(result.raw));
+          const rawObject =
+            result?.raw && typeof result.raw === "object" ? result.raw : null;
+          const errorText = isError
+            ? [
+                result?.error,
+                result?.raw,
+                ...(Array.isArray(result?.content)
+                  ? result.content.map((item) => item?.text)
+                  : []),
+              ]
+                .filter(Boolean)
+                .map((item) =>
+                  typeof item === "string" ? item : JSON.stringify(item)
+                )
+                .join("\n")
+            : "";
+
+          // 摘要状态顺序：先由 isError/结构化 success 确定成败；只有失败时才进一步细分“拒绝”，最后再判超时。
+          const isRejected =
+            isError &&
+            (rawObject?.rejected_by_user === true ||
+              rawObject?.error_type === "approval_rejected" ||
+              /manual\s*approval\s*was\s*rejected|rejected\s*by\s*user|approval\s*rejected|用户拒绝|人工审核.*拒绝/i.test(
+                errorText
+              ));
+          const isTimeout =
+            isError &&
+            !isRejected &&
+            /超时|timeout|timed\s*out|DIRECT_TOOL_TIMEOUT|TIMEOUT/i.test(
+              errorText
+            );
+          const statusText = isRejected
+            ? "调用拒绝"
+            : isTimeout
+            ? "调用超时"
+            : isError
+            ? "调用失败"
+            : "调用成功";
+          toolStatusSummaryItems.push(`${toolCall.name} ${statusText}`);
 
           if (shouldShowVCP || forceThisOne) {
             const vcpText = vcpInfoHandler.streamVcpInfo(
@@ -329,6 +372,18 @@ class NonStreamHandler {
               conversationHistoryForClient.push(vcpText);
             }
           }
+        }
+
+        if (toolStatusSummaryItems.length > 0) {
+          if (!hasStartedUserBlock && enableRoleDivider) {
+            conversationHistoryForClient.push("\n<<<[ROLE_DIVIDE_USER]>>>\n");
+            hasStartedUserBlock = true;
+          }
+          conversationHistoryForClient.push(
+            `\n[本轮工具调用摘要:]\n${toolStatusSummaryItems.join(
+              "；"
+            )}。\n[本轮工具调用摘要结束]\n`
+          );
         }
 
         if (hasStartedUserBlock && enableRoleDivider) {
@@ -391,7 +446,7 @@ class NonStreamHandler {
             retries: apiRetries,
             delay: apiRetryDelay,
             debugMode: DEBUG_MODE,
-            connectionTimeout: 600000, // 10 分钟，适应 Claude extended thinking 等长推理模型
+            connectionTimeout: 600000,
             modelFallbackCandidates: semanticModelFallbackCandidates,
           }
         );

@@ -11,6 +11,7 @@ export const APP_ROUTE_COMPONENTS = {
   "vcptavern-editor": () => import("@/views/VcptavernEditor.vue"),
   "agent-files-editor": () => import("@/views/AgentFilesEditor.vue"),
   "agent-assistant-config": () => import("@/views/AgentAssistantConfig.vue"),
+  "agent-emotion-manager": () => import("@/views/AgentEmotionManager.vue"),
   "forum-assistant-config": () => import("@/views/ForumAssistantConfig.vue"),
   "agent-scores": () => import("@/views/AgentScores.vue"),
   "toolbox-manager": () => import("@/views/ToolboxManager.vue"),
@@ -29,6 +30,7 @@ export const APP_ROUTE_COMPONENTS = {
   "semantic-model-router-editor": () =>
     import("@/views/SemanticModelRouterEditor.vue"),
   "final-context-viewer": () => import("@/views/FinalContextViewer.vue"),
+  "bridge-hijack-config": () => import("@/views/BridgeHijackConfig.vue"),
   "theme-editor": () => import("@/views/ThemeEditor.vue"),
   "placeholder-viewer": () => import("@/views/PlaceholderViewer.vue"),
   plugins: () => import("@/views/PluginsHub.vue"),

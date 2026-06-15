@@ -5,8 +5,11 @@
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const chokidar = require('chokidar');
+const { CONFIG_PATH, migrateBridgeConfig, normalizeBridgeConfig, parseModelMap } = require('./bridgeConfig');
 
 let server = null;
+let configWatcher = null;
 let runtimeConfig = {};
 
 // ============================================================
@@ -14,29 +17,82 @@ let runtimeConfig = {};
 // ============================================================
 
 function initialize(config) {
-    // 默认上游自动指向本地 VCP 主服务器，无需用户手动配置
-    const mainServerPort = config.PORT || process.env.PORT || 6005;
-    const mainServerKey = config.Key || process.env.Key || '';
-    const defaultUpstream = `http://127.0.0.1:${mainServerPort}`;
-
-    runtimeConfig = {
-        port: config.BRIDGE_PORT || 3100,
-        upstreamUrl: (config.BRIDGE_UPSTREAM_URL || defaultUpstream).replace(/\/+$/, ''),
-        upstreamKey: config.BRIDGE_UPSTREAM_KEY || mainServerKey,
-        upstreamType: normalizeApiType(config.BRIDGE_UPSTREAM_TYPE),
-        defaultModel: config.BRIDGE_MODEL || 'gpt-4.1-mini',
-        systemPrompt: resolveSystemPrompt(config.BRIDGE_SYSTEM_PROMPT || ''),
-        hijackMode: (config.BRIDGE_HIJACK_MODE || 'off').toLowerCase(),
-        modelMap: parseModelMap(config.BRIDGE_MODEL_MAP || ''),
-        debugMode: config.DebugMode || false,
-        basePath: config.PROJECT_BASE_PATH || __dirname
-    };
-
+    const bridgeConfig = migrateBridgeConfig();
+    applyBridgeRuntimeConfig(bridgeConfig, config, true);
+    startConfigWatcher(config);
     startServer();
     console.log(`[VCPBridgeServer] Initialized. Hijack mode: ${runtimeConfig.hijackMode}, Port: ${runtimeConfig.port}, Upstream: ${runtimeConfig.upstreamUrl}`);
 }
 
+function applyBridgeRuntimeConfig(bridgeConfig, hostConfig = {}, isInitial = false) {
+    // 默认上游自动指向本地 VCP 主服务器，无需用户手动配置
+    const mainServerPort = hostConfig.PORT || process.env.PORT || 6005;
+    const mainServerKey = hostConfig.Key || process.env.Key || '';
+    const defaultUpstream = `http://127.0.0.1:${mainServerPort}`;
+
+    const normalized = normalizeBridgeConfig({
+        ...bridgeConfig,
+        mainServerPort,
+        upstreamUrl: bridgeConfig.upstreamUrl || defaultUpstream,
+        upstreamKey: bridgeConfig.upstreamKey || mainServerKey
+    });
+
+    const previousPort = runtimeConfig.port;
+    runtimeConfig = {
+        port: normalized.port,
+        upstreamUrl: normalized.upstreamUrl,
+        upstreamKey: normalized.upstreamKey,
+        upstreamType: normalized.upstreamType,
+        defaultModel: normalized.defaultModel,
+        systemPrompt: resolveSystemPrompt(normalized.systemPrompt),
+        hijackMode: normalized.hijackMode,
+        modelMap: parseModelMap(normalized.modelMap),
+        debugMode: normalized.debugMode,
+        basePath: hostConfig.PROJECT_BASE_PATH || __dirname,
+        configPath: CONFIG_PATH
+    };
+
+    if (!isInitial && previousPort && previousPort !== runtimeConfig.port) {
+        console.warn(`[VCPBridgeServer] bridge-config.json port changed from ${previousPort} to ${runtimeConfig.port}. Port changes require plugin/server restart.`);
+    }
+
+    if (!isInitial) {
+        console.log(`[VCPBridgeServer] Hot config reloaded. Hijack mode: ${runtimeConfig.hijackMode}, Upstream: ${runtimeConfig.upstreamUrl}`);
+    }
+}
+
+function startConfigWatcher(hostConfig = {}) {
+    if (configWatcher) return;
+
+    configWatcher = chokidar.watch(CONFIG_PATH, {
+        ignoreInitial: true,
+        awaitWriteFinish: {
+            stabilityThreshold: 250,
+            pollInterval: 50
+        }
+    });
+
+    const reload = () => {
+        try {
+            const bridgeConfig = migrateBridgeConfig();
+            applyBridgeRuntimeConfig(bridgeConfig, hostConfig, false);
+        } catch (error) {
+            console.error('[VCPBridgeServer] Failed to hot reload bridge-config.json:', error);
+        }
+    };
+
+    configWatcher.on('add', reload);
+    configWatcher.on('change', reload);
+    configWatcher.on('error', error => {
+        console.error('[VCPBridgeServer] bridge-config.json watcher error:', error);
+    });
+}
+
 function shutdown() {
+    if (configWatcher) {
+        configWatcher.close();
+        configWatcher = null;
+    }
     if (server) {
         server.close();
         server = null;
@@ -67,19 +123,6 @@ function resolveSystemPrompt(raw) {
         }
     }
     return trimmed;
-}
-
-function parseModelMap(raw) {
-    if (!raw) return {};
-    return raw.split(',').reduce((acc, pair) => {
-        const idx = pair.indexOf(':');
-        if (idx > 0) {
-            const alias = pair.slice(0, idx).trim();
-            const target = pair.slice(idx + 1).trim();
-            if (alias && target) acc[alias] = target;
-        }
-        return acc;
-    }, {});
 }
 
 function resolveModel(model) {
@@ -522,6 +565,20 @@ function applySystemPromptHijack(messages) {
             return result;
         }
 
+        case 'merge': {
+            // 合并所有 system 消息为一条置顶 system；注入提示词优先，然后按原消息顺序拼接已有 system。
+            const systemContents = [
+                injected.content,
+                ...result
+                    .filter(m => m.role === 'system')
+                    .map(m => m.content)
+                    .filter(content => typeof content === 'string' && content.trim())
+            ];
+            const mergedSystem = { role: 'system', content: systemContents.join('\n\n') };
+            const nonSystem = result.filter(m => m.role !== 'system');
+            return [mergedSystem, ...nonSystem];
+        }
+
         default:
             return result;
     }
@@ -770,7 +827,8 @@ function startServer() {
             hasSystemPrompt: Boolean(runtimeConfig.systemPrompt),
             upstreamType: runtimeConfig.upstreamType,
             upstreamUrl: runtimeConfig.upstreamUrl,
-            modelMap: runtimeConfig.modelMap
+            modelMap: runtimeConfig.modelMap,
+            configPath: runtimeConfig.configPath
         });
     });
 
@@ -793,7 +851,8 @@ function startServer() {
     app.post('/v1/messages', async (req, res) => {
         const body = req.body || {};
         const messages = extractFromAnthropicBody(body);
-        await proxyRequest(req, res, { messages, model: body.model, body, downstreamFormat: 'anthropic' });
+        const stream = body.stream === true || String(req.headers.accept || '').includes('text/event-stream');
+        await proxyRequest(req, res, { messages, model: body.model, body: { ...body, stream }, downstreamFormat: 'anthropic' });
     });
 
     // Gemini GenerateContent
