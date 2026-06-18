@@ -3,6 +3,8 @@
 
 const http = require("http");
 const https = require("https");
+const net = require("net");
+const tls = require("tls");
 
 const DEFAULT_ENDPOINT = "https://api.anysearch.com/mcp";
 const TIMEOUT_DEFAULT_MS = 30000;
@@ -12,6 +14,7 @@ const MAX_RESULTS_MIN = 1;
 const MAX_RESULTS_MAX = 10;
 const BATCH_MAX = 5;
 const DOMAINS_MAX = 5;
+const RETRIES_DEFAULT = 5;
 
 // Official AnySearch domains. Flow: pick the matching domain, call get_sub_domains(domain)
 // to learn its sub_domains + required params, then run a vertical `search`.
@@ -263,14 +266,290 @@ function resolveTransport(url) {
   fail("ANYSEARCH_ENDPOINT 必须是 https:// 地址（http:// 仅允许 127.0.0.1）。");
 }
 
-function callAnySearch(toolName, args) {
+// ═══════════════════════════════════════════════════════════════
+// 代理池支持（HTTP CONNECT + SOCKS5 隧道）+ 轮换重试机制
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * 解析单个代理 URL。
+ * 支持 http://host:port (HTTP CONNECT) 和 socks5://host:port (SOCKS5)。
+ * 无协议前缀时默认 http。
+ * @returns {{type:"http"|"socks5",host:string,port:number}}
+ */
+function parseProxyUrl(str) {
+  let url;
+  try {
+    if (!/^[a-z]+:\/\//i.test(str)) str = "http://" + str;
+    url = new URL(str);
+  } catch (_) {
+    fail(`ANYSEARCH_PROXY 中 "${str}" 不是合法 URL。`);
+  }
+  const type = url.protocol === "socks5:" ? "socks5" : "http";
+  const host = url.hostname;
+  if (!host) fail(`ANYSEARCH_PROXY 中 "${str}" 缺少 hostname。`);
+  const port = parseInt(url.port, 10) || (type === "socks5" ? 1080 : 80);
+  return { type, host, port };
+}
+
+/**
+ * 解析 ANYSEARCH_PROXY 环境变量为代理池。
+ * 支持逗号分隔多个代理地址，实现故障转移和负载轮换。
+ * @returns {Array<{type:string,host:string,port:number}>}
+ */
+function getProxyPool() {
+  const proxyStr = (process.env.ANYSEARCH_PROXY || "").trim();
+  if (!proxyStr) return [];
+  return proxyStr
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map(parseProxyUrl);
+}
+
+/**
+ * 公共 JSON-RPC 响应解析（直连与代理路径共用）。
+ */
+function parseJsonRpcResponse(raw, statusCode) {
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (_) {
+    throw new Error(`API 返回了非 JSON 响应：${raw.slice(0, 500)}`);
+  }
+  if (statusCode >= 400) {
+    throw new Error(`HTTP ${statusCode}: ${JSON.stringify(data)}`);
+  }
+  if (data.error) {
+    throw new Error(data.error.message || JSON.stringify(data.error));
+  }
+  const result = data.result || {};
+  const content = Array.isArray(result.content) ? result.content : [];
+  const textItem = content.find((item) => item && item.type === "text");
+  return textItem ? textItem.text : JSON.stringify(result, null, 2);
+}
+
+/**
+ * 构建 JSON-RPC 请求 body + headers（直连与代理共用）。
+ */
+function buildRequestPayload(toolName, args) {
   const body = JSON.stringify({
     jsonrpc: "2.0",
     id: 1,
     method: "tools/call",
     params: { name: toolName, arguments: args },
   });
+  const headers = {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(body),
+  };
+  const apiKey = pickApiKey();
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  return { body, headers };
+}
 
+/**
+ * 解码 HTTP chunked transfer encoding。
+ */
+function dechunk(body) {
+  let result = "";
+  let pos = 0;
+  while (pos < body.length) {
+    const lineEnd = body.indexOf("\r\n", pos);
+    if (lineEnd < 0) break;
+    const sizeHex = body.slice(pos, lineEnd).trim();
+    const size = parseInt(sizeHex, 16);
+    if (isNaN(size) || size === 0) break;
+    pos = lineEnd + 2;
+    result += body.slice(pos, pos + size);
+    pos += size + 2;
+  }
+  return result || body;
+}
+
+/**
+ * 建立 HTTP CONNECT 隧道。
+ * @returns {Promise<{sock:net.Socket}>}
+ */
+function establishHttpConnect(proxy, targetHost, targetPort) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(proxy.port, proxy.host);
+    sock.setTimeout(15000);
+    let buf = "";
+
+    sock.on("connect", () => {
+      sock.write(
+        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
+        `Host: ${targetHost}:${targetPort}\r\n\r\n`
+      );
+    });
+
+    sock.on("data", function onConnectData(d) {
+      buf += d.toString("binary");
+      if (!buf.includes("\r\n\r\n")) return;
+      sock.removeListener("data", onConnectData);
+
+      const firstLine = buf.split("\r\n")[0];
+      if (!firstLine.includes("200")) {
+        sock.destroy();
+        reject(new Error(`HTTP 代理 CONNECT 失败: ${firstLine.trim()}`));
+        return;
+      }
+      // TLS 握手由 tls.connect 从底层 socket 自动读取，无需手动注入残留数据
+      resolve({ sock });
+    });
+
+    sock.on("timeout", () => {
+      sock.destroy();
+      reject(new Error("HTTP 代理连接超时。"));
+    });
+    sock.on("error", (e) => reject(e));
+  });
+}
+
+// SOCKS5 错误码映射（RFC 1928 §6）
+const SOCKS5_ERRORS = {
+  1: "一般性失败",
+  2: "规则不允许连接",
+  3: "网络不可达",
+  4: "主机不可达",
+  5: "连接被拒绝",
+  6: "TTL 过期",
+  7: "不支持的 CONNECT 命令",
+  8: "不支持的地址类型",
+};
+
+/**
+ * 建立 SOCKS5 隧道（RFC 1928）。
+ * 仅支持无认证模式（0x00），不支持用户名/密码认证。
+ * @returns {Promise<{sock:net.Socket}>}
+ */
+function establishSocks5(proxy, targetHost, targetPort) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect(proxy.port, proxy.host);
+    sock.setTimeout(15000);
+    let phase = "negotiate"; // negotiate → connect → done
+
+    sock.on("connect", () => {
+      // SOCKS5 版本协商：版本 5，1 种认证方法，无认证 (0x00)
+      sock.write(Buffer.from([0x05, 0x01, 0x00]));
+    });
+
+    sock.on("data", function onData(d) {
+      if (phase === "negotiate") {
+        if (d.length < 2 || d[0] !== 0x05) {
+          sock.destroy();
+          reject(new Error("SOCKS5 协商失败：代理返回了无效响应。"));
+          return;
+        }
+        if (d[1] !== 0x00) {
+          sock.destroy();
+          reject(new Error(`SOCKS5 代理要求认证（方法 0x${d[1].toString(16)}），暂不支持。`));
+          return;
+        }
+        phase = "connect";
+        // 发送 CONNECT 请求（域名类型 0x03）
+        const hostBuf = Buffer.from(targetHost, "ascii");
+        const req = Buffer.alloc(7 + hostBuf.length);
+        req[0] = 0x05; // SOCKS 版本
+        req[1] = 0x01; // CONNECT 命令
+        req[2] = 0x00; // 保留
+        req[3] = 0x03; // 地址类型：域名
+        req[4] = hostBuf.length;
+        hostBuf.copy(req, 5);
+        req.writeUInt16BE(targetPort, 5 + hostBuf.length);
+        sock.write(req);
+        return;
+      }
+
+      if (phase === "connect") {
+        if (d.length < 4 || d[0] !== 0x05) {
+          sock.destroy();
+          reject(new Error("SOCKS5 CONNECT 响应无效。"));
+          return;
+        }
+        if (d[1] !== 0x00) {
+          sock.destroy();
+          const desc = SOCKS5_ERRORS[d[1]] || `错误码 ${d[1]}`;
+          reject(new Error(`SOCKS5 CONNECT 失败: ${desc}。`));
+          return;
+        }
+        phase = "done";
+        sock.removeListener("data", onData);
+        resolve({ sock });
+        return;
+      }
+    });
+
+    sock.on("timeout", () => {
+      sock.destroy();
+      reject(new Error("SOCKS5 代理连接超时。"));
+    });
+    sock.on("error", (e) => reject(e));
+  });
+}
+
+/**
+ * 在已建立的隧道上执行 TLS 握手 + HTTP POST 请求。
+ * HTTP CONNECT 和 SOCKS5 共用此函数。
+ */
+function callViaTunnel(toolName, args, tunnelResult, targetUrl) {
+  const { body, headers } = buildRequestPayload(toolName, args);
+  const targetHost = targetUrl.hostname;
+  const targetPort = targetUrl.port || 443;
+  const targetPath = `${targetUrl.pathname}${targetUrl.search}`;
+  const timeoutMs = getTimeoutMs();
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, val) => { if (!settled) { settled = true; fn(val); } };
+    const { sock } = tunnelResult;
+
+    const tlsSock = tls.connect(
+      { socket: sock, servername: targetHost, rejectUnauthorized: true },
+      () => {
+        const httpReq =
+          `POST ${targetPath} HTTP/1.1\r\n` +
+          `Host: ${targetHost}\r\n` +
+          `Content-Type: application/json\r\n` +
+          `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+          (headers.Authorization ? `Authorization: ${headers.Authorization}\r\n` : "") +
+          `Connection: close\r\n\r\n` +
+          body;
+        tlsSock.write(httpReq);
+      }
+    );
+
+    let resp = "";
+    tlsSock.setEncoding("utf8");
+    tlsSock.on("data", (chunk) => { resp += chunk; });
+    tlsSock.on("end", () => {
+      const sep = resp.indexOf("\r\n\r\n");
+      if (sep < 0) {
+        done(reject, new Error("代理路径返回的 HTTP 响应格式异常。"));
+        return;
+      }
+      const headerBlock = resp.slice(0, sep);
+      const statusLine = headerBlock.split("\r\n")[0];
+      const statusCode = parseInt(statusLine.split(" ")[1], 10) || 0;
+      let respBody = resp.slice(sep + 4);
+      if (/transfer-encoding:\s*chunked/i.test(headerBlock)) {
+        respBody = dechunk(respBody);
+      }
+      try { done(resolve, parseJsonRpcResponse(respBody, statusCode)); }
+      catch (e) { done(reject, e); }
+    });
+    tlsSock.on("error", (e) => done(reject, e));
+    tlsSock.setTimeout(timeoutMs, () => {
+      tlsSock.destroy();
+      done(reject, new Error("API 请求超时。"));
+    });
+  });
+}
+
+/**
+ * 直连请求（不走代理）。
+ */
+function callAnySearchDirect(toolName, args) {
   const endpoint = (process.env.ANYSEARCH_ENDPOINT || DEFAULT_ENDPOINT).trim() || DEFAULT_ENDPOINT;
   let url;
   try {
@@ -279,54 +558,117 @@ function callAnySearch(toolName, args) {
     fail("ANYSEARCH_ENDPOINT 不是合法 URL。");
   }
   const transport = resolveTransport(url);
-
-  const headers = {
-    "Content-Type": "application/json",
-    "Content-Length": Buffer.byteLength(body),
-  };
-  const apiKey = pickApiKey();
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-
-  const options = {
-    hostname: url.hostname,
-    port: url.port || (url.protocol === "http:" ? 80 : 443),
-    path: `${url.pathname}${url.search}`,
-    method: "POST",
-    headers,
-  };
+  const { body, headers } = buildRequestPayload(toolName, args);
+  const timeoutMs = getTimeoutMs();
 
   return new Promise((resolve, reject) => {
-    const req = transport.request(options, (res) => {
-      let raw = "";
-      res.setEncoding("utf8");
-      res.on("data", (chunk) => { raw += chunk; });
-      res.on("end", () => {
-        let data;
-        try {
-          data = JSON.parse(raw);
-        } catch (_) {
-          reject(new Error(`API 返回了非 JSON 响应：${raw.slice(0, 500)}`));
-          return;
-        }
-        if (res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode}: ${JSON.stringify(data)}`));
-          return;
-        }
-        if (data.error) {
-          reject(new Error(data.error.message || JSON.stringify(data.error)));
-          return;
-        }
-        const result = data.result || {};
-        const content = Array.isArray(result.content) ? result.content : [];
-        const textItem = content.find((item) => item && item.type === "text");
-        resolve(textItem ? textItem.text : JSON.stringify(result, null, 2));
-      });
-    });
-
-    req.setTimeout(getTimeoutMs(), () => req.destroy(new Error("API 请求超时。")));
+    const req = transport.request(
+      {
+        hostname: url.hostname,
+        port: url.port || (url.protocol === "http:" ? 80 : 443),
+        path: `${url.pathname}${url.search}`,
+        method: "POST",
+        headers,
+      },
+      (res) => {
+        let data = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => { data += chunk; });
+        res.on("end", () => {
+          try { resolve(parseJsonRpcResponse(data, res.statusCode || 0)); }
+          catch (e) { reject(e); }
+        });
+      }
+    );
     req.on("error", reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      reject(new Error("API 请求超时。"));
+    });
     req.write(body);
     req.end();
+  });
+}
+
+/**
+ * 通过指定代理发送请求（HTTP CONNECT 或 SOCKS5）。
+ */
+async function callAnySearchViaProxy(toolName, args, proxy) {
+  const endpoint = (process.env.ANYSEARCH_ENDPOINT || DEFAULT_ENDPOINT).trim() || DEFAULT_ENDPOINT;
+  let targetUrl;
+  try {
+    targetUrl = new URL(endpoint);
+  } catch (_) {
+    fail("ANYSEARCH_ENDPOINT 不是合法 URL。");
+  }
+  if (targetUrl.protocol !== "https:") {
+    fail("使用代理时 ANYSEARCH_ENDPOINT 必须是 https:// 地址。");
+  }
+
+  const targetHost = targetUrl.hostname;
+  const targetPort = targetUrl.port || 443;
+
+  // 根据代理类型建立隧道
+  const tunnelResult = proxy.type === "socks5"
+    ? await establishSocks5(proxy, targetHost, targetPort)
+    : await establishHttpConnect(proxy, targetHost, targetPort);
+
+  return callViaTunnel(toolName, args, tunnelResult, targetUrl);
+}
+
+/**
+ * Dispatcher：根据代理配置 + 当前尝试次数选择请求路径。
+ * 每次重试轮换到代理池中的下一个代理。
+ */
+function callAnySearch(toolName, args, proxyPool, attempt) {
+  if (!proxyPool) proxyPool = getProxyPool();
+
+  // loopback endpoint 强制直连
+  const endpoint = (process.env.ANYSEARCH_ENDPOINT || DEFAULT_ENDPOINT).trim() || DEFAULT_ENDPOINT;
+  try {
+    const url = new URL(endpoint);
+    if (url.protocol === "http:" && isLoopback(url.hostname)) {
+      return callAnySearchDirect(toolName, args);
+    }
+  } catch (_) { /* endpoint 格式错误由 Direct 路径报 */ }
+
+  if (proxyPool.length === 0) return callAnySearchDirect(toolName, args);
+
+  // 轮换代理：attempt 从 1 开始，按代理池长度取模
+  const proxy = proxyPool[(attempt - 1) % proxyPool.length];
+  return callAnySearchViaProxy(toolName, args, proxy);
+}
+
+/**
+ * 重试包装：仅对网络层错误重试（超时、连接重置、TLS 失败等）。
+ * 业务错误（HTTP 4xx、API error）不重试。
+ * 每次重试自动轮换到代理池中的下一个代理。
+ */
+function callAnySearchWithRetry(toolName, args) {
+  const maxRetries = parseInt(process.env.ANYSEARCH_MAX_RETRIES || "", 10) || RETRIES_DEFAULT;
+  const proxyPool = getProxyPool();
+
+  return new Promise((resolve, reject) => {
+    let attempt = 0;
+    const tryOnce = () => {
+      attempt++;
+      callAnySearch(toolName, args, proxyPool, attempt).then(resolve).catch((error) => {
+        const msg = error.message || String(error);
+        const isNetworkError = /超时|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket hang up|代理.*失败|代理.*超时|TLS|disconnected|SOCKS5|CONNECT 失败|响应格式异常/i.test(msg);
+        if (!isNetworkError || attempt >= maxRetries) {
+          reject(error);
+          return;
+        }
+        const nextProxy = proxyPool.length > 0
+          ? proxyPool[attempt % proxyPool.length]
+          : null;
+        if (nextProxy) {
+          process.stderr.write(`[AnySearch] 第 ${attempt}/${maxRetries} 次尝试失败（${msg.slice(0, 80)}），切换到代理 ${nextProxy.type}://${nextProxy.host}:${nextProxy.port}\n`);
+        }
+        tryOnce();
+      });
+    };
+    tryOnce();
   });
 }
 
@@ -335,7 +677,7 @@ async function main() {
     const payload = parsePayload(await readStdin());
     const command = normalizeCommand(payload);
     const args = ARGUMENT_BUILDERS[command](payload);
-    const content = await callAnySearch(command, args);
+    const content = await callAnySearchWithRetry(command, args);
     const text = typeof content === "string" && content.trim()
       ? content.trim()
       : "AnySearch API 未返回可读文本内容。";

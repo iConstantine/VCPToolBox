@@ -1,6 +1,6 @@
 {
   "enabled": true,
-  "tailTagPlacement": "inline",
+  "tailTagPlacement": "system_user_block",
   "maxContextBlocks": 10,
   "timeInsert": true,
   "description": {

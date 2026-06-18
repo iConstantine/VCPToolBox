@@ -29,6 +29,16 @@
       "type": "integer",
       "description": "HTTP 请求超时（毫秒），默认 30000，范围 1000-120000。",
       "default": 30000
+    },
+    "ANYSEARCH_PROXY": {
+      "type": "string",
+      "description": "代理地址池，逗号分隔多个。支持 http://host:port (HTTP CONNECT) 和 socks5://host:port (SOCKS5)。无前缀默认 http。留空则直连。每次重试自动轮换代理。例如 http://10.61.17.172:7890,socks5://10.61.17.172:7891",
+      "default": ""
+    },
+    "ANYSEARCH_MAX_RETRIES": {
+      "type": "integer",
+      "description": "请求失败重试次数（仅对网络超时/连接错误生效，默认 5）。每次重试自动切换到代理池中的下一个代理。",
+      "default": 5
     }
   },
   "capabilities": {

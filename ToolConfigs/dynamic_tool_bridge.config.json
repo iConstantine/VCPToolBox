@@ -10,7 +10,9 @@
   "classifierTimeoutMs": 30000,
   "useRagEmbeddings": true,
   "manualOverrides": {
-    "excludedOriginKeys": [],
+    "excludedOriginKeys": [
+      "distributed:dist-mqhm9h4q-q8y068b:TableLampRemote"
+    ],
     "pinnedOriginKeys": [],
     "categoryAliases": {},
     "descriptionOverrides": {}
