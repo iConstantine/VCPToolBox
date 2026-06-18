@@ -91,7 +91,7 @@ class StreamHandler {
         let streamAborted = false;
         let keepAliveTimer = null;
         let chunkIdleTimer = null;
-        const CHUNK_IDLE_TIMEOUT = 90000; // 90 秒无新 chunk 则判定上游流冻结
+        const CHUNK_IDLE_TIMEOUT = 600000; // 10 分钟无新 chunk 则判定上游流冻结（90s 对 Claude opus extended thinking 太短，thinking 期间可能数分钟不发 chunk）
         let message = { content: "", reasoning_content: "" };
 
         const appendDelta = (delta) => {
