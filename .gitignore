@@ -240,11 +240,18 @@ Plugin/XiaohongshuFetch/config.env
 # ==== 插件商店 ====
 pluginStoreSources.json
 tmp/
+*.tmp
 Plugin/.backup/
 
 # ==== Agent 提示词（个人定制，不跟踪） ====
 Agent/*.txt
+Agent/**/*.txt
 
 # Ignored plugins
 Plugin/DigitalOracle/
 Plugin/TavilySearch/
+
+# ==== 运行时数据/日志（个人私有，不跟踪） ====
+Plugin/VCPTavern/access_logs.json
+Plugin/VCPBridgeServer/profiles/
+Plugin/VCPBridgeServer/weimingsnow.txt
