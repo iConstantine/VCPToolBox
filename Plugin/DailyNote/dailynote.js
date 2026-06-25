@@ -22,6 +22,15 @@ const VAR_HTTP_URL = process.env.VarHttpUrl;
 // Config for 'create' command
 const CONFIGURED_EXTENSION = (process.env.DAILY_NOTE_EXTENSION || "txt").toLowerCase() === "md" ? "md" : "txt";
 
+// Tag AI helper configuration (disabled by default)
+const TAG_MASTER_ENABLED = (process.env.TagMaster || "false").toLowerCase() === "true";
+const TAG_MODEL = process.env.TagModel || 'gemini-2.5-flash-preview-09-2025-thinking';
+const TAG_MODEL_MAX_OUTPUT_TOKENS = parseInt(process.env.TagModelMaxOutPutTokens || '30000', 10);
+const TAG_MODEL_MAX_TOKENS = parseInt(process.env.TagModelMaxTokens || '40000', 10);
+const TAG_MODEL_PROMPT_FILE = process.env.TagModelPrompt || 'TagMaster.txt';
+const API_KEY = process.env.API_Key;
+const API_URL = process.env.API_URL;
+
 // Fuzzy Diff for Update Failures
 const FUZZY_DIFF_ENABLED = (process.env.DAILY_NOTE_FUZZY_DIFF || "false").toLowerCase() === "true";
 const UPDATE_FAILURE_HINT = "请检查字段或标点符号是否与原文一致；若多次失败，可尝试使用 DailyNoteManager 插件 list 对应文件夹/日期，以检索日记原文状态后再重试。";
@@ -124,6 +133,132 @@ function fixTagFormat(tagLine) {
 }
 
 
+function extractTagFromAIResponse(aiResponse) {
+    debugLog('Extracting tag from AI response:', aiResponse);
+
+    const match = aiResponse.match(/\[\[Tag:\s*(.+?)\]\]/i);
+    if (match && match[1]) {
+        const tagContent = match[1].trim();
+        const result = 'Tag: ' + tagContent;
+        debugLog('Extracted tag:', result);
+        return result;
+    }
+
+    debugLog('No tag found in AI response');
+    return null;
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function generateTagsWithAI(content, maxRetries = 3) {
+    debugLog('Generating tags with AI model...');
+
+    if (!TAG_MASTER_ENABLED) {
+        debugLog('TagMaster disabled, skipping AI tag generation.');
+        return null;
+    }
+
+    if (!API_KEY || !API_URL) {
+        console.error('[DailyNote] API configuration missing. Cannot generate tags.');
+        return null;
+    }
+
+    const promptFilePath = path.join(__dirname, TAG_MODEL_PROMPT_FILE);
+    let systemPrompt;
+    try {
+        systemPrompt = await fs.readFile(promptFilePath, 'utf-8');
+    } catch (err) {
+        console.error('[DailyNote] Failed to read TagMaster prompt file:', err.message);
+        return null;
+    }
+
+    const requestData = {
+        model: TAG_MODEL,
+        messages: [
+            {
+                role: 'system',
+                content: systemPrompt
+            },
+            {
+                role: 'user',
+                content: content
+            }
+        ],
+        max_tokens: TAG_MODEL_MAX_TOKENS,
+        max_output_tokens: TAG_MODEL_MAX_OUTPUT_TOKENS,
+        temperature: 0.7
+    };
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            debugLog(`Calling AI API (attempt ${attempt}/${maxRetries}) with model: ${TAG_MODEL}`);
+
+            const fetch = (await import('node-fetch')).default;
+            const response = await fetch(`${API_URL}/v1/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${API_KEY}`
+                },
+                body: JSON.stringify(requestData),
+                timeout: 60000
+            });
+
+            if (response.status === 500 || response.status === 503) {
+                const errorText = await response.text();
+                console.error(`[DailyNote] Tag AI API returned ${response.status} (attempt ${attempt}/${maxRetries}):`, errorText);
+
+                if (attempt < maxRetries) {
+                    const backoffTime = Math.pow(2, attempt - 1) * 1000;
+                    debugLog(`Retrying tag generation after ${backoffTime}ms...`);
+                    await delay(backoffTime);
+                    continue;
+                }
+
+                console.error('[DailyNote] Max retries reached. Giving up tag generation.');
+                return null;
+            }
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                console.error('[DailyNote] Tag AI API error:', response.status, errorText);
+                return null;
+            }
+
+            const result = await response.json();
+            if (result.choices && result.choices.length > 0 && result.choices[0].message) {
+                const aiResponse = result.choices[0].message.content;
+                debugLog('Tag AI response:', aiResponse);
+
+                const tagLine = extractTagFromAIResponse(aiResponse);
+                if (tagLine) {
+                    debugLog(`Successfully generated tag on attempt ${attempt}`);
+                }
+                return tagLine;
+            }
+
+            console.error('[DailyNote] Unexpected Tag AI response format:', result);
+            return null;
+        } catch (error) {
+            console.error(`[DailyNote] Tag AI error on attempt ${attempt}/${maxRetries}:`, error.message);
+
+            if (attempt < maxRetries) {
+                const backoffTime = Math.pow(2, attempt - 1) * 1000;
+                debugLog(`Retrying tag generation after ${backoffTime}ms due to error...`);
+                await delay(backoffTime);
+                continue;
+            }
+
+            console.error('[DailyNote] Max retries reached after errors. Giving up tag generation.');
+            return null;
+        }
+    }
+
+    return null;
+}
+
 async function processTags(contentText, externalTag) {
     debugLog('Processing tags...');
     const detection = detectTagLine(contentText);
@@ -146,11 +281,23 @@ async function processTags(contentText, externalTag) {
         const fixedTag = fixTagFormat(detection.lastLine);
         // Ensure there's exactly one newline before the tag.
         return detection.contentWithoutLastLine.trimEnd() + '\n' + fixedTag;
-    } else {
-        // No tag found in either place, throw an error.
-        debugLog('No tag detected in content or as an argument. Throwing error.');
-        throw new Error("Tag is missing. Please provide a 'Tag' argument or add a 'Tag:' line at the end of the 'Content'.");
     }
+
+    if (TAG_MASTER_ENABLED) {
+        debugLog('No tag detected, TagMaster enabled; generating with AI...');
+        const generatedTag = await generateTagsWithAI(contentText);
+        if (generatedTag) {
+            const fixedTag = fixTagFormat(generatedTag);
+            debugLog('Generated and appended tag:', fixedTag);
+            return contentText.trimEnd() + '\n' + fixedTag;
+        }
+
+        console.warn('[DailyNote] TagMaster enabled but failed to generate tags. Falling back to missing-tag error.');
+    }
+
+    // No tag found in either place, throw an error.
+    debugLog('No tag detected in content or as an argument. Throwing error.');
+    throw new Error("Tag is missing. Please provide a 'Tag' argument or add a 'Tag:' line at the end of the 'Content'.");
 }
 
 // --- Local File URL Processing ---
@@ -265,20 +412,29 @@ async function processLocalFiles(content) {
 }
 
 // --- 'create' Command Logic ---
+function contentStartsWithAiTimePrefix(content) {
+    return /^\s*\[\d{1,2}:\d{2}(?::\d{2})?\](?=\s|$)/.test(content);
+}
+
 async function handleCreateCommand(args) {
     // 兼容 'Date'/'dateString', 'Content'/'contentText'/'content', 'maid'/'maidName' (case-insensitive for maid)
     // 新增 folder 字段：用于直接指定存储目录，避免必须把目录塞进 maid 的 [文件夹]署名格式。
     // 额外兼容 fold，降低模型误拼写导致目录未生效的概率。
     const maid = args.maid || args.maidName || args.Maid || args.MAID;
     const folder = args.folder || args.Folder || args.folderName || args.FolderName || args.fold || args.Fold;
-    const dateString = args.dateString || args.Date;
+    let dateString = args.dateString || args.Date;
     const contentText = args.contentText || args.Content || args.content;
+    // 如果没有传入 Date，则使用系统当前日期
+    if (!dateString) {
+        const d = new Date();
+        dateString = `${d.getFullYear()}-${(d.getMonth() + 1).toString().padStart(2, '0')}-${d.getDate().toString().padStart(2, '0')}`;
+    }
     const tag = args.Tag || args.tag;
     const fileName = args.fileName || args.FileName;
 
     debugLog(`Processing 'create' for Maid: ${maid}, Folder: ${folder || 'Not specified'}, Date: ${dateString}, fileName: ${fileName}`);
-    if (!maid || !dateString || !contentText) {
-        return { status: "error", error: 'Invalid input for create: Missing maid/maidName, dateString/Date, or contentText/Content/content.' };
+    if (!maid || !contentText) {
+        return { status: "error", error: 'Invalid input for create: Missing maid/maidName or contentText/Content/content.' };
     }
 
     try {
@@ -362,7 +518,10 @@ async function handleCreateCommand(args) {
         }
 
         debugLog(`Target file path: ${filePath}`);
-        const fileContent = `[${datePart}] - ${actualMaidName}\n${processedContent}`;
+        const timeStringForContent = `${hours}:${minutes}`;
+        const fileContent = contentStartsWithAiTimePrefix(processedContent)
+            ? `[${datePart}] - ${actualMaidName}\n${processedContent}`
+            : `[${datePart}] - ${actualMaidName}\n[${timeStringForContent}]\n${processedContent}`;
         await fs.writeFile(filePath, fileContent);
         debugLog(`Successfully wrote file (length: ${fileContent.length})`);
         return {

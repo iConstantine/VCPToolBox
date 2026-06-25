@@ -11,6 +11,7 @@ const chokidar = require('chokidar');
 const { getAuthCode } = require('./modules/captchaDecoder'); // 导入统一的解码函数
 const ToolApprovalManager = require('./modules/toolApprovalManager');
 const { hasFoldMarkers, buildDynamicFoldObject } = require('./modules/foldProtocol');
+const { sanitizeToolResult } = require('./modules/toolResultPrivacyGuard');
 
 const PLUGIN_DIR = path.join(__dirname, 'Plugin');
 const manifestFileName = 'plugin-manifest.json';
@@ -42,6 +43,18 @@ class PluginManager extends EventEmitter {
         this.tdbKnowledgeManager = null; // 冷知识库管理器，等待 server.js 注入
         this.toolApprovalManager = new ToolApprovalManager(path.join(__dirname, 'toolApprovalConfig.json'));
         this.pendingApprovals = new Map(); // requestId -> { resolve, reject, timeoutId }
+    }
+
+    _sanitizeToolResultForAi(result) {
+        try {
+            const privacyConfig = this.toolApprovalManager?.getPrivacyProtectionConfig
+                ? this.toolApprovalManager.getPrivacyProtectionConfig()
+                : { enabled: false };
+            return sanitizeToolResult(result, privacyConfig);
+        } catch (error) {
+            console.error(`[PluginManager] Tool result privacy protection failed, returning original result to avoid breaking tool flow: ${error.message}`);
+            return result;
+        }
     }
 
     setWebSocketServer(wss) {
@@ -861,7 +874,7 @@ class PluginManager extends EventEmitter {
         };
     }
 
-    async processToolCall(toolName, toolArgs, requestIp = null, sourceNode = null) {
+    async processToolCall(toolName, toolArgs, requestIp = null, sourceNode = null, executionOptions = {}) {
         const plugin = this.plugins.get(toolName);
         if (!plugin) {
             throw new Error(`[PluginManager] Plugin "${toolName}" not found for tool call.`);
@@ -1073,7 +1086,11 @@ class PluginManager extends EventEmitter {
                 const logParam = executionParam ? (executionParam.length > 100 ? executionParam.substring(0, 100) + '...' : executionParam) : null;
                 if (this.debugMode) console.log(`[PluginManager] Calling local executePlugin for: ${toolName} with prepared param:`, logParam);
 
-                const pluginOutput = await this.executePlugin(toolName, executionParam, requestIp); // Returns {status, result/error}
+                const pluginOutput = await this.executePlugin(toolName, executionParam, requestIp, executionOptions); // Returns {status, result/error}
+
+                if (pluginOutput.__vcpArcheryNoReplySilent) {
+                    return pluginOutput.result;
+                }
 
                 if (pluginOutput.status === "success") {
                     if (typeof pluginOutput.result === 'string') {
@@ -1109,7 +1126,7 @@ class PluginManager extends EventEmitter {
             finalResultObject.timestamp = _getFormattedLocalTimestamp();
             _filterFuzzyDiff(finalResultObject, _getFormattedLocalTimestamp());
 
-            return finalResultObject;
+            return this._sanitizeToolResultForAi(finalResultObject);
 
         } catch (e) {
             console.error(`[PluginManager processToolCall] Error during execution for plugin ${toolName}:`, e.message);
@@ -1127,11 +1144,11 @@ class PluginManager extends EventEmitter {
                 errorObject.timestamp = _getFormattedLocalTimestamp();
             }
             _filterFuzzyDiff(errorObject, _getFormattedLocalTimestamp());
-            throw new Error(JSON.stringify(errorObject));
+            throw new Error(JSON.stringify(this._sanitizeToolResultForAi(errorObject)));
         }
     }
 
-    async executePlugin(pluginName, inputData, requestIp = null) {
+    async executePlugin(pluginName, inputData, requestIp = null, executionOptions = {}) {
         const plugin = this.plugins.get(pluginName);
         if (!plugin) {
             // This case should ideally be caught by processToolCall before calling executePlugin
@@ -1244,6 +1261,10 @@ class PluginManager extends EventEmitter {
             let processExited = false;
             let initialResponseSent = false; // Flag for async plugins
             const isAsyncPlugin = plugin.pluginType === 'asynchronous';
+            const isArcheryNoReply = isAsyncPlugin && executionOptions?.archeryNoReply === true;
+            const noReplyGraceMs = Number.isFinite(Number(executionOptions?.archeryNoReplyGraceMs))
+                ? Math.max(0, Number(executionOptions.archeryNoReplyGraceMs))
+                : 3000;
 
             const timeoutDuration = plugin.communication.timeout || (isAsyncPlugin ? 1800000 : 60000); // Use manifest timeout, or 30min for async, 1min for sync
 
@@ -1266,6 +1287,30 @@ class PluginManager extends EventEmitter {
                 }
             }, timeoutDuration);
 
+            const resolveArcheryNoReplySilent = (reason) => {
+                if (!isArcheryNoReply || processExited || initialResponseSent) return false;
+                initialResponseSent = true;
+                if (this.debugMode) {
+                    console.log(`[PluginManager executePlugin Internal] Async no-reply plugin "${pluginName}" resolved silently. reason=${reason}`);
+                }
+                resolve({
+                    status: "success",
+                    __vcpArcheryNoReplySilent: true,
+                    result: {
+                        status: "success",
+                        noReply: true,
+                        __vcpArcheryNoReplySilent: true,
+                        toolName: pluginName,
+                        message: `Async no-reply tool "${pluginName}" accepted silently (${reason}).`
+                    }
+                });
+                return true;
+            };
+
+            const noReplyTimerId = isArcheryNoReply ? setTimeout(() => {
+                resolveArcheryNoReplySilent(`no_response_after_${noReplyGraceMs}ms`);
+            }, noReplyGraceMs) : null;
+
             pluginProcess.stdout.setEncoding('utf8');
             pluginProcess.stdout.on('data', (data) => {
                 if (processExited || (isAsyncPlugin && initialResponseSent)) {
@@ -1287,6 +1332,11 @@ class PluginManager extends EventEmitter {
                         if (parsedOutput && (parsedOutput.status === "success" || parsedOutput.status === "error")) {
                             if (isAsyncPlugin) {
                                 if (!initialResponseSent) {
+                                    if (noReplyTimerId) clearTimeout(noReplyTimerId);
+                                    if (isArcheryNoReply && parsedOutput.status === "success") {
+                                        resolveArcheryNoReplySilent('initial_success_json');
+                                        return;
+                                    }
                                     if (this.debugMode) console.log(`[PluginManager executePlugin Internal] Async plugin "${pluginName}" sent initial JSON response. Resolving promise.`);
                                     initialResponseSent = true;
                                     // For async, we resolve with the first valid JSON and let the process continue if it has non-daemon threads.
@@ -1317,6 +1367,7 @@ class PluginManager extends EventEmitter {
 
             pluginProcess.on('error', (err) => {
                 processExited = true; clearTimeout(timeoutId);
+                if (noReplyTimerId) clearTimeout(noReplyTimerId);
                 if (!initialResponseSent) { // Only reject if initial response (for async) or any response (for sync) hasn't been sent
                     reject(new Error(`Failed to start plugin "${pluginName}": ${err.message}`));
                 } else if (this.debugMode) {
@@ -1327,6 +1378,7 @@ class PluginManager extends EventEmitter {
             pluginProcess.on('exit', (code, signal) => {
                 processExited = true;
                 clearTimeout(timeoutId); // Clear the main timeout once the process exits.
+                if (noReplyTimerId) clearTimeout(noReplyTimerId);
 
                 if (isAsyncPlugin && initialResponseSent) {
                     // For async plugins where initial response was already sent, log exit but don't re-resolve/reject.
@@ -1362,7 +1414,23 @@ class PluginManager extends EventEmitter {
                 }
 
                 if (!initialResponseSent) { // Only reject if no response has been sent yet
-                    if (code !== 0) {
+                    if (isArcheryNoReply && code === 0) {
+                        initialResponseSent = true;
+                        if (this.debugMode) {
+                            console.log(`[PluginManager executePlugin Internal] Async no-reply plugin "${pluginName}" exited with code 0 before initial JSON. Resolving silently.`);
+                        }
+                        resolve({
+                            status: "success",
+                            __vcpArcheryNoReplySilent: true,
+                            result: {
+                                status: "success",
+                                noReply: true,
+                                __vcpArcheryNoReplySilent: true,
+                                toolName: pluginName,
+                                message: `Async no-reply tool "${pluginName}" exited successfully before initial JSON.`
+                            }
+                        });
+                    } else if (code !== 0) {
                         let detailedError = `Plugin "${pluginName}" exited with code ${code}.`;
                         if (outputBuffer.trim()) detailedError += ` Stdout: ${outputBuffer.trim().substring(0, 200)}`;
                         if (errorOutput.trim()) detailedError += ` Stderr: ${errorOutput.trim().substring(0, 200)}`;

@@ -152,6 +152,8 @@ ModelRedirect.json
 agent_map.json
 preprocessor_order.json
 tag-processor-config.env
+# 多模态识别 JSON 真相源（首启自动生成；私密提示词不应入库）
+multimodal-config.json
 
 # ===== 运行时数据 / 缓存 =====
 *.sqlite
@@ -172,6 +174,9 @@ backup_before_rebase_manual/
 sarprompt.json
 dailynote/*
 !dailynote/VCP桌面知识/
+!dailynote/VCP桌面知识/**
+!dailynote/VCP开发/
+!dailynote/VCP开发/**
 ip_blacklist.json
 /VectorStore
 knowledge/
@@ -255,3 +260,6 @@ Plugin/TavilySearch/
 Plugin/VCPTavern/access_logs.json
 Plugin/VCPBridgeServer/profiles/
 Plugin/VCPBridgeServer/weimingsnow.txt
+
+# ==== 开发SDK ====
+Plugin/VCPQQBotServer/bot-node-sdk-main

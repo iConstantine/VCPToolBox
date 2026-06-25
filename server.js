@@ -451,6 +451,49 @@ try {
 const CHINA_MODEL_1_COT =
   (process.env.ChinaModel1Cot || "false").toLowerCase() === "true";
 
+// 多模态配置 JSON 真相源（multimodal-config.json）：优先级高于 config.env，支持热更新
+// 在初始化阶段先确保文件存在并加载内存配置；运行时由 chatCompletionHandler / image-processor 直接调用 store。
+const multiModalConfigStore = require("./modules/multiModalConfigStore.js");
+try {
+  multiModalConfigStore.init();
+  console.log(
+    "[Server] multimodal-config.json 配置真相源已加载，路径：",
+    multiModalConfigStore.CONFIG_PATH
+  );
+} catch (multiModalInitErr) {
+  console.error(
+    "[Server] 初始化 multimodal-config.json 失败：",
+    multiModalInitErr
+  );
+}
+
+// 纯文本模型强制翻译多模态：tag 列表，命中即无视 {{TransBase64}}/{{TransBase64+}} 占位符
+// 用于配合模型动态路由（VCPModelAuto/SemanticModelRouter），避免把 base64 多模态传给纯文本模型
+// 仅作为启动快照保留；运行时 chatCompletionHandler 会从 multiModalConfigStore 拉取最新值
+let MULTIMODAL_FORCE_TRANSLATE_MODELS = [];
+try {
+  const storeTags = multiModalConfigStore.getForceTranslateModels();
+  if (Array.isArray(storeTags) && storeTags.length > 0) {
+    MULTIMODAL_FORCE_TRANSLATE_MODELS = storeTags;
+  } else {
+    MULTIMODAL_FORCE_TRANSLATE_MODELS = (
+      process.env.MultiModalForceTranslateModels || ""
+    )
+      .split(",")
+      .map((tag) => tag.trim().toLowerCase())
+      .filter((tag) => tag !== "");
+  }
+  if (MULTIMODAL_FORCE_TRANSLATE_MODELS.length > 0) {
+    console.log(
+      `[Server] MultiModalForceTranslateModels 启动快照已加载 ${
+        MULTIMODAL_FORCE_TRANSLATE_MODELS.length
+      } 个 tag: [${MULTIMODAL_FORCE_TRANSLATE_MODELS.join(", ")}]`
+    );
+  }
+} catch (e) {
+  console.error("Failed to parse MultiModalForceTranslateModels:", e);
+}
+
 // 新增：模型重定向功能
 const ModelRedirectHandler = require("./modelRedirectHandler.js");
 const modelRedirectHandler = new ModelRedirectHandler();
@@ -655,12 +698,10 @@ app.use((req, res, next) => {
 
   if (clientIp && ipBlacklist.includes(clientIp)) {
     console.warn(`[Security] 已阻止来自黑名单IP ${clientIp} 的请求。`);
-    return res
-      .status(403)
-      .json({
-        error:
-          "Forbidden: Your IP address has been blocked due to suspicious activity.",
-      });
+    return res.status(403).json({
+      error:
+        "Forbidden: Your IP address has been blocked due to suspicious activity.",
+    });
   }
   next();
 });
@@ -1129,13 +1170,11 @@ app.post("/v1/schedule_task", async (req, res) => {
     !tool_call.tool_name ||
     !tool_call.arguments
   ) {
-    return res
-      .status(400)
-      .json({
-        status: "error",
-        error:
-          "请求无效，缺少 'schedule_time', 'task_id', 或有效的 'tool_call' 对象。",
-      });
+    return res.status(400).json({
+      status: "error",
+      error:
+        "请求无效，缺少 'schedule_time', 'task_id', 或有效的 'tool_call' 对象。",
+    });
   }
 
   const targetDate = new Date(schedule_time);
@@ -1180,12 +1219,10 @@ app.post("/v1/schedule_task", async (req, res) => {
     });
   } catch (error) {
     console.error(`[Server] 通过API创建定时任务文件时出错:`, error);
-    res
-      .status(500)
-      .json({
-        status: "error",
-        error: "在服务器上保存定时任务时发生内部错误。",
-      });
+    res.status(500).json({
+      status: "error",
+      error: "在服务器上保存定时任务时发生内部错误。",
+    });
   }
 });
 
@@ -1338,22 +1375,18 @@ app.post("/v1/interrupt", (req, res) => {
     }, 1000); // 延迟1秒删除，确保所有异步操作完成
 
     // 向中断请求的发起者返回成功响应
-    res
-      .status(200)
-      .json({
-        status: "success",
-        message: `Interrupt signal sent for request ${id}.`,
-      });
+    res.status(200).json({
+      status: "success",
+      message: `Interrupt signal sent for request ${id}.`,
+    });
   } else {
     console.log(
       `[Interrupt] Received stop signal for non-existent or completed ID: ${id}`
     );
-    res
-      .status(404)
-      .json({
-        status: "error",
-        message: `Request ${id} not found or already completed.`,
-      });
+    res.status(404).json({
+      status: "error",
+      message: `Request ${id} not found or already completed.`,
+    });
   }
 });
 
@@ -1395,6 +1428,7 @@ const chatCompletionHandler = new ChatCompletionHandler({
   chinaModel1: CHINA_MODEL_1,
   chinaModel1Cot: CHINA_MODEL_1_COT,
   semanticModelRouter,
+  multiModalForceTranslateModels: MULTIMODAL_FORCE_TRANSLATE_MODELS, // 纯文本模型 tag 命中后强制翻译多模态
 });
 
 // Route for standard chat completions. VCP info is shown based on the .env config.
@@ -1459,12 +1493,10 @@ app.post("/v1/human/tool", async (req, res) => {
     );
 
     if (!parsedToolCall || !parsedToolCall.name) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "Malformed request: tool_name not found within the request block.",
-        });
+      return res.status(400).json({
+        error:
+          "Malformed request: tool_name not found within the request block.",
+      });
     }
 
     const requestedToolName = parsedToolCall.name;
@@ -1774,12 +1806,10 @@ app.post("/plugin-callback/:pluginName/:taskId", async (req, res) => {
       `[Server Callback] Plugin manifest not found for: ${pluginName}`
     );
     // Still attempt to acknowledge the callback if possible, but log error
-    return res
-      .status(404)
-      .json({
-        status: "error",
-        message: "Plugin not found, but callback noted.",
-      });
+    return res.status(404).json({
+      status: "error",
+      message: "Plugin not found, but callback noted.",
+    });
   }
 
   // 2. WebSocket push (existing logic)
@@ -2053,9 +2083,14 @@ async function startServer() {
     const vcpKeyValue =
       pluginManager.getResolvedPluginConfigValue("VCPLog", "VCP_Key") ||
       process.env.VCP_Key;
+    const distributedMusicPlaylistSyncEnabled =
+      (
+        process.env.DISTRIBUTED_MUSIC_PLAYLIST_SYNC_ENABLED || "false"
+      ).toLowerCase() === "true";
     webSocketServer.initialize(server, {
       debugMode: DEBUG_MODE,
       vcpKey: vcpKeyValue,
+      distributedMusicPlaylistSyncEnabled,
     });
 
     // --- 注入依赖 ---

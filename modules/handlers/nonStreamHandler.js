@@ -177,9 +177,90 @@ class NonStreamHandler {
       vcpToolUseForbidden,
       semanticModelFallbackCandidates,
       oneRingResponseMeta,
+      shouldProcessMedia,
+      shouldProcessMediaPlus,
+      isTextOnlyForceTranslateModel,
+      requestPreprocessorConfig,
     } = this.context;
 
     const shouldShowVCP = SHOW_VCP_OUTPUT || this.context.forceShowVCP;
+
+    const containsImageUrlPart = (content) =>
+      Array.isArray(content) &&
+      content.some(
+        (part) =>
+          part?.type === "image_url" &&
+          part.image_url &&
+          typeof part.image_url.url === "string"
+      );
+
+    const maybeTranslateToolPayloadMedia = async (content) => {
+      if (!containsImageUrlPart(content)) return content;
+
+      const shouldTranslateToolMedia =
+        shouldProcessMedia || isTextOnlyForceTranslateModel;
+      if (!shouldTranslateToolMedia) return content;
+
+      const processorName = pluginManager.messagePreprocessors.has(
+        "MultiModalProcessor"
+      )
+        ? "MultiModalProcessor"
+        : "ImageProcessor";
+      if (!pluginManager.messagePreprocessors.has(processorName)) {
+        if (DEBUG_MODE)
+          console.warn(
+            `[VCP NonStream Loop] Tool payload contains image_url, but ${processorName} is unavailable. Forwarding original payload.`
+          );
+        return content;
+      }
+
+      const originalImageParts = content.filter(
+        (part) =>
+          part?.type === "image_url" &&
+          part.image_url &&
+          typeof part.image_url.url === "string"
+      );
+      const payloadMessage = {
+        role: "user",
+        content: JSON.parse(JSON.stringify(content)),
+      };
+
+      if (DEBUG_MODE) {
+        console.log(
+          `[VCP NonStream Loop] Translating tool-returned image_url content via ${processorName}. textOnly=${!!isTextOnlyForceTranslateModel}, plus=${!!shouldProcessMediaPlus}`
+        );
+      }
+
+      let translatedMessages;
+      try {
+        translatedMessages = await pluginManager.executeMessagePreprocessor(
+          processorName,
+          [payloadMessage],
+          requestPreprocessorConfig || {}
+        );
+      } catch (pluginError) {
+        console.error(
+          `[VCP NonStream Loop] Error translating tool-returned media via ${processorName}:`,
+          pluginError
+        );
+        return content;
+      }
+
+      const translatedContent = translatedMessages?.[0]?.content;
+      if (!Array.isArray(translatedContent)) return content;
+
+      if (shouldProcessMediaPlus && !isTextOnlyForceTranslateModel) {
+        const translatedWithoutImages = translatedContent.filter(
+          (part) => part?.type !== "image_url"
+        );
+        return [
+          ...translatedWithoutImages,
+          ...JSON.parse(JSON.stringify(originalImageParts)),
+        ];
+      }
+
+      return translatedContent;
+    };
 
     const fetchNonStreamCompletion = (body, label) =>
       fetchWithRetry(
@@ -295,6 +376,7 @@ class NonStreamHandler {
         const { normal: normalCalls, archery: archeryCalls } =
           ToolCallParser.separate(toolCalls);
         const archeryErrorContents = [];
+        const archeryStatusSummaryItems = [];
 
         // 执行 Archery 调用
         const archeryLogs = await Promise.all(
@@ -310,6 +392,7 @@ class NonStreamHandler {
                 (result.raw && this.context.isToolResultError(result.raw));
 
               if (isError) {
+                archeryStatusSummaryItems.push(`${toolCall.name} 调用失败`);
                 archeryErrorContents.push({
                   type: "text",
                   text: `[异步工具 "${toolCall.name}" 返回了错误，请注意]:\n${result.content[0].text}`,
@@ -364,6 +447,22 @@ class NonStreamHandler {
             role: "user",
             content: errorPayload,
           });
+
+          if (archeryStatusSummaryItems.length > 0) {
+            if (enableRoleDivider) {
+              conversationHistoryForClient.push("\n<<<[ROLE_DIVIDE_USER]>>>\n");
+            }
+            conversationHistoryForClient.push(
+              `\n[本轮工具调用摘要:]\n${archeryStatusSummaryItems.join(
+                "；"
+              )}。\n[本轮工具调用摘要结束]\n`
+            );
+            if (enableRoleDivider) {
+              conversationHistoryForClient.push(
+                "\n<<<[END_ROLE_DIVIDE_USER]>>>\n"
+              );
+            }
+          }
 
           const recursionBody = {
             ...originalBody,
@@ -458,7 +557,7 @@ class NonStreamHandler {
 
         // VCP 信息展示 - 批量包裹为单个 USER 角色
         let hasStartedUserBlock = false;
-        const toolStatusSummaryItems = [];
+        const toolStatusSummaryItems = [...archeryStatusSummaryItems];
         for (let i = 0; i < normalCalls.length; i++) {
           const toolCall = normalCalls[i];
           const result = toolResults[i];
@@ -568,11 +667,14 @@ class NonStreamHandler {
         const hasImage = combinedToolResultsForAI.some(
           (item) => item.type === "image_url"
         );
-        const finalToolPayloadForAI = hasImage
-          ? [
+        const translatedToolResultsForAI = hasImage
+          ? await maybeTranslateToolPayloadMedia([
               { type: "text", text: `<!-- VCP_TOOL_PAYLOAD -->\nResults:` },
               ...combinedToolResultsForAI,
-            ]
+            ])
+          : null;
+        const finalToolPayloadForAI = hasImage
+          ? translatedToolResultsForAI
           : `<!-- VCP_TOOL_PAYLOAD -->\n${toolResultsTextForRAG}`;
 
         currentMessagesForNonStreamLoop.push({
