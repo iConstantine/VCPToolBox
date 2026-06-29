@@ -51,9 +51,14 @@
       ></div>
 
       <!-- 主内容区 -->
-      <main ref="contentRef" class="content" id="config-details-container">
+      <main class="content">
         <section class="unified-page-header">
           <h1>{{ currentPageTitle }}</h1>
+          <div
+            id="page-header-actions"
+            ref="pageHeaderActionsRef"
+            class="unified-page-header__actions"
+          ></div>
         </section>
 
         <!-- 返回顶部按钮 -->
@@ -68,12 +73,12 @@
           <span class="material-symbols-outlined">keyboard_arrow_up</span>
         </button>
 
-        <!-- 路由视图 -->
-        <router-view v-slot="{ Component, route }">
-          <transition name="fade" mode="out-in">
+        <div ref="contentRef" class="content-scroll-region" id="config-details-container">
+          <!-- 路由视图 -->
+          <router-view v-if="isPageHeaderActionsReady" v-slot="{ Component, route }">
             <component :is="Component" :key="route.fullPath" :data-page="String(route.name || '')" />
-          </transition>
-        </router-view>
+          </router-view>
+        </div>
       </main>
     </div>
 
@@ -120,7 +125,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, nextTick, onMounted, ref } from "vue";
 import FeedbackHost from "@/components/feedback/FeedbackHost.vue";
 import SolarSystemBg from "@/components/SolarSystemBg.vue";
 import GlobalCommandPalette from "@/components/layout/GlobalCommandPalette.vue";
@@ -162,6 +167,13 @@ const {
 const navItems = computed(() => appStore.navItems);
 const plugins = computed(() => appStore.plugins);
 const pinnedPluginNames = computed(() => appStore.pinnedPluginNames);
+const pageHeaderActionsRef = ref<HTMLElement | null>(null);
+const isPageHeaderActionsReady = ref(false);
+
+onMounted(async () => {
+  await nextTick();
+  isPageHeaderActionsReady.value = pageHeaderActionsRef.value !== null;
+});
 
 void contentRef;
 </script>
@@ -205,22 +217,117 @@ void contentRef;
     var(--app-viewport-height, 100vh) - var(--app-top-bar-height, 48px)
   );
   margin-top: var(--app-top-bar-height, 48px);
+  background: var(--app-shell-bg);
   transition: opacity 1.8s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
+.admin-layout.sidebar-collapsed .container {
+  gap: 12px;
+}
+
 .content {
+  position: relative;
+  display: flex;
+  flex-direction: column;
   flex-grow: 1;
-  padding: 24px 32px;
   box-sizing: border-box;
-  overflow-y: auto;
+  border: 0;
+  overflow: hidden;
   height: 100%;
-  /* 透明：露出底层 SolarSystemBg 星空 */
+  background: var(--app-content-bg);
+  clip-path: inset(0 round var(--radius-xl));
+  /* 白色主画布；星空保持在全局最底层 */
   /* 不在默认态设置 identity transform，避免创建 stacking context */
   opacity: 1;
   transition:
     opacity 1.6s cubic-bezier(0.4, 0, 0.2, 1),
     transform 2s cubic-bezier(0.4, 0, 0.2, 1),
-    filter 1.8s ease;
+    filter 1.8s ease,
+    border-color var(--transition-fast);
+}
+
+.content-scroll-region {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 6px 16px 16px;
+  box-sizing: border-box;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--secondary-text) 12%, transparent)
+    transparent;
+}
+
+.content-scroll-region:hover {
+  scrollbar-color: color-mix(in srgb, var(--secondary-text) 28%, transparent)
+    transparent;
+}
+
+.content-scroll-region::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
+}
+
+.content-scroll-region::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.content-scroll-region::-webkit-scrollbar-button,
+.content-scroll-region::-webkit-scrollbar-button:single-button,
+.content-scroll-region::-webkit-scrollbar-button:vertical:start,
+.content-scroll-region::-webkit-scrollbar-button:vertical:end,
+.content-scroll-region::-webkit-scrollbar-button:vertical:decrement,
+.content-scroll-region::-webkit-scrollbar-button:vertical:increment {
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.content-scroll-region::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--secondary-text) 10%, transparent);
+  background-clip: content-box;
+  border: 3px solid transparent;
+  border-block-width: 18px;
+  border-radius: 999px;
+}
+
+.content-scroll-region:hover::-webkit-scrollbar-thumb {
+  background-color: color-mix(in srgb, var(--secondary-text) 26%, transparent);
+}
+
+.content-scroll-region:hover::-webkit-scrollbar-thumb:hover {
+  background-color: color-mix(in srgb, var(--secondary-text) 42%, transparent);
+}
+
+:global(html:not([data-theme-shell-layout]) .container),
+:global(html[data-theme-shell-layout="inset"] .container) {
+  padding: 4px 8px 4px 0;
+}
+
+:global(html:not([data-theme-shell-layout]) .content),
+:global(html[data-theme-shell-layout="inset"] .content) {
+  height: calc(100% - 8px);
+  margin: 0 0 0 0;
+  border: 1px solid color-mix(in srgb, var(--border-color) 82%, transparent);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-overlay-soft);
+}
+
+:global(html[data-theme-shell-layout="sidebar"] .container) {
+  padding: 0;
+  background: transparent;
+}
+
+:global(html[data-theme-shell-layout="sidebar"] .content) {
+  height: 100%;
+  border: 0;
+  border-radius: 0;
+  clip-path: inset(0 round 0);
+  box-shadow: none;
 }
 
 .sidebar-overlay {
@@ -450,9 +557,36 @@ void contentRef;
   z-index: 998;
 }
 
+.unified-page-header {
+  position: relative;
+  z-index: 20;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 20px 16px 12px;
+  overflow: visible;
+}
+
 .unified-page-header h1 {
-  font-size: var(--font-size-title);
-  line-height: 1.25;
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 1.125rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.unified-page-header__actions {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 36px;
 }
 
 /* 淡入淡出动画 */
@@ -469,16 +603,23 @@ void contentRef;
 /* 移动端适配 */
 @media (max-width: 768px) {
   .content {
-    padding: 14px;
+    padding: 0;
+  }
+
+  .content-scroll-region {
+    padding: 4px 12px 12px;
   }
 
   .unified-page-header {
-    margin: 0 0 14px;
-    padding: 12px 14px;
+    padding: 12px 12px 10px;
   }
 
   .unified-page-header h1 {
-    font-size: var(--font-size-emphasis);
+    font-size: 1rem;
+  }
+
+  .unified-page-header__actions {
+    min-height: 32px;
   }
 
   .back-to-top-btn {
@@ -492,11 +633,17 @@ void contentRef;
 
 @media (max-width: 480px) {
   .content {
-    padding: 12px;
+    padding: 0;
+  }
+
+  .content-scroll-region {
+    padding: 4px 12px 12px;
   }
 
   .unified-page-header {
-    margin-bottom: 12px;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: var(--space-2);
     padding: 10px 12px;
     border-radius: 12px;
   }
