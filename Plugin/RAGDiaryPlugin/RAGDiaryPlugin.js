@@ -20,6 +20,7 @@ const TextSanitizer = require('./TextSanitizer.js');
 const VectorMathUtils = require('./VectorMathUtils.js');
 const AttachmentMemoUtils = require('./AttachmentMemoUtils.js');
 const RAGResultFormatter = require('./RAGResultFormatter.js');
+const BM25QueryOptimizer = require('./BM25QueryOptimizer.js');
 const { chunkText } = require('../../TextChunker.js');
 const { getEmbeddingsBatch } = require('../../EmbeddingUtils.js');
 const {
@@ -94,6 +95,9 @@ class RAGDiaryPlugin {
             dailyNoteRootPath,
             logger: console
         });
+
+        // 🔎 BM25 查询优化器：实体词提升、AI 主题漂移门控、查询 token 限频
+        this.bm25QueryOptimizer = new BM25QueryOptimizer({ logger: console });
     }
 
     async loadConfig() {
@@ -625,31 +629,33 @@ class RAGDiaryPlugin {
     _buildWeightedBM25QueryText(userContent, aiContent) {
         const config = this.ragParams?.RAGDiaryPlugin || {};
         const weights = Array.isArray(config.mainSearchWeights) ? config.mainSearchWeights : [0.7, 0.3];
-        const userWeight = Number.isFinite(Number(weights[0])) ? Math.max(0, Number(weights[0])) : 0.7;
-        const aiWeight = Number.isFinite(Number(weights[1])) ? Math.max(0, Number(weights[1])) : 0.3;
-        const weightSum = userWeight + aiWeight;
 
-        const normalize = (text) => this.directDiaryTextProcessor.normalizeBM25QueryInput(String(text || ''));
-        const userText = normalize(userContent);
-        const aiText = normalize(aiContent);
+        const optimized = this.bm25QueryOptimizer.createQueryText({
+            userText: userContent,
+            aiText: aiContent,
+            baseWeights: weights,
+            normalize: (text) => this.directDiaryTextProcessor.normalizeBM25QueryInput(String(text || '')),
+            tokenize: (text) => this.directDiaryTextProcessor.tokenize(text),
+            options: config.bm25QueryOptimizer || {}
+        });
 
-        if (!userText && !aiText) return '';
+        if (optimized.queryText) {
+            console.log(
+                `[RAGDiaryPlugin] BM25 query optimized: ` +
+                `tokens=${optimized.queryTokens.length}, terms=${optimized.selectedTerms.length}, ` +
+                `userRatio=${optimized.userRatio.toFixed(2)}, aiRatio=${optimized.aiRatio.toFixed(2)}, ` +
+                `aiGate=${optimized.aiTopicGate.toFixed(2)}, overlap=${optimized.topicOverlap.toFixed(3)}`
+            );
+        }
 
-        const userRatio = weightSum > 0 ? userWeight / weightSum : 0.7;
-        const aiRatio = weightSum > 0 ? aiWeight / weightSum : 0.3;
-        const scale = this.ragParams?.RAGDiaryPlugin?.bm25QueryRepeatScale || 10;
-        const userRepeats = userText ? Math.max(1, Math.round(userRatio * scale)) : 0;
-        const aiRepeats = aiText ? Math.max(1, Math.round(aiRatio * scale)) : 0;
-
-        return [
-            ...new Array(userRepeats).fill(userText),
-            ...new Array(aiRepeats).fill(aiText)
-        ].filter(Boolean).join('\n');
+        return optimized.queryText;
     }
 
-    async _getBM25RagCandidates(dbName, userContent, aiContent, limit, mode, queryVector, contextDiaryPrefixes = new Set(), requestCache = null) {
+    async _getBM25RagCandidates(dbName, userContent, aiContent, limit, mode, queryVector, contextDiaryPrefixes = new Set(), requestCache = null, bm25Weight = 0.6) {
         const weightedQueryText = this._buildWeightedBM25QueryText(userContent, aiContent);
         const safeLimit = Math.max(1, parseInt(limit, 10) || 10);
+        const sparseWeight = Math.max(0, Math.min(1, Number.isFinite(Number(bm25Weight)) ? Number(bm25Weight) : 0.6));
+        const vectorWeight = 1 - sparseWeight;
         const bm25Candidates = await this.directDiaryTextProcessor.getBM25DiaryCandidates(
             dbName,
             weightedQueryText,
@@ -692,7 +698,7 @@ class RAGDiaryPlugin {
             const vectorScore = queryVector && chunk.vector
                 ? this.cosineSimilarity(queryVector, chunk.vector)
                 : 0;
-            const hybridScore = (bm25Info.normalizedBM25Score * 0.65) + (vectorScore * 0.35);
+            const hybridScore = (bm25Info.normalizedBM25Score * sparseWeight) + (vectorScore * vectorWeight);
 
             return {
                 ...chunk,
@@ -713,7 +719,9 @@ class RAGDiaryPlugin {
             results,
             queryTokens: bm25Candidates.queryTokens || [],
             matchedCount: bm25Candidates.matchedCount || results.length,
-            weightedQueryText
+            weightedQueryText,
+            bm25Weight: sparseWeight,
+            vectorWeight
         };
     }
 
@@ -2138,6 +2146,26 @@ class RAGDiaryPlugin {
         return truncateMatch ? parseFloat(truncateMatch[1]) : 0;
     }
 
+    _extractBM25Weight(modifiers) {
+        if (!modifiers || typeof modifiers !== 'string') return 0.6;
+        const bm25WeightMatch = modifiers.match(/::BM25\+?(\d*\.?\d+)?(?=$|::|[^\d.])/i);
+        if (!bm25WeightMatch || bm25WeightMatch[1] === undefined) return 0.6;
+
+        const parsedWeight = parseFloat(bm25WeightMatch[1]);
+        if (!Number.isFinite(parsedWeight)) return 0.6;
+        return Math.max(0, Math.min(1, parsedWeight));
+    }
+
+    _extractTimeRatio(modifiers) {
+        if (!modifiers || typeof modifiers !== 'string') return 0.2;
+        const timeRatioMatch = modifiers.match(/::Time(\d*\.?\d+)?(?=$|::|[^\d.])/i);
+        if (!timeRatioMatch || timeRatioMatch[1] === undefined) return 0.2;
+
+        const parsedRatio = parseFloat(timeRatioMatch[1]);
+        if (!Number.isFinite(parsedRatio)) return 0.2;
+        return Math.max(0, Math.min(1, parsedRatio));
+    }
+
     _extractKMultiplier(modifiers) {
         const kMultiplierMatch = modifiers.match(/:(\d+\.?\d*)/);
         return kMultiplierMatch ? parseFloat(kMultiplierMatch[1]) : 1.0;
@@ -2588,7 +2616,8 @@ class RAGDiaryPlugin {
         // 3️⃣ 缓存未命中，执行原有逻辑
 
         const kMultiplier = this._extractKMultiplier(modifiers);
-        const useTime = allowTimeAndGroup && modifiers.includes('::Time');
+        const useTime = allowTimeAndGroup && /::Time(?:\d*\.?\d+)?(?=$|::|[^\d.])/i.test(modifiers);
+        const timeRatio = useTime ? this._extractTimeRatio(modifiers) : null;
         const useGroup = allowTimeAndGroup && modifiers.includes('::Group');
         // 🌟 Rerank+ (RRF): 解析 ::Rerank+ 修饰符
         // 语法: ::Rerank+ (默认α=0.5) 或 ::Rerank+0.7 (α=0.7, Reranker占70%权重)
@@ -2599,6 +2628,7 @@ class RAGDiaryPlugin {
 
         const bm25Mode = this.directDiaryTextProcessor.getBM25Mode(modifiers);
         const useBM25 = bm25Mode !== null;
+        const bm25Weight = useBM25 ? this._extractBM25Weight(modifiers) : null;
 
         // ✅ 解析 TimeDecay 参数：::TimeDecay[halfLife]/[minScore]/[whitelistTags]
         // 示例：::TimeDecay30/0.5/box归档
@@ -2649,7 +2679,9 @@ class RAGDiaryPlugin {
             dbName: dbName,
             modifiers: modifiers,
             k: finalK,
-            bm25: useBM25 ? bm25Mode : undefined
+            bm25: useBM25 ? bm25Mode : undefined,
+            bm25Weight: useBM25 ? bm25Weight : undefined,
+            timeRatio: useTime ? timeRatio : undefined
             // V4.0: originalQuery has been removed to save tokens.
         };
 
@@ -2727,7 +2759,8 @@ class RAGDiaryPlugin {
                 bm25Mode,
                 finalQueryVector,
                 contextDiaryPrefixes,
-                requestCache
+                requestCache,
+                bm25Weight
             );
 
             if (bm25InfoForBroadcast.results.length > 0) {
@@ -2739,9 +2772,10 @@ class RAGDiaryPlugin {
 
         if (useTime && timeRanges && timeRanges.length > 0) {
             // --- 🌟 V5: 平衡双路召回 (Balanced Dual-Path Retrieval) ---
-            // 目标：语义召回占 60%，时间召回占 40%，且时间召回也进行相关性排序
-            const kSemantic = Math.max(1, Math.ceil(finalK * 0.6));
-            const kTime = Math.max(1, finalK - kSemantic);
+            // 目标：默认语义召回占 80%，时间召回占 20%，且时间召回也进行相关性排序。
+            // 可用 ::Time0.1 / ::Time0.3 显式控制时间路比例。
+            const kTime = Math.max(1, Math.round(finalK * timeRatio));
+            const kSemantic = Math.max(1, finalK - kTime);
 
             // 1. 语义路召回 (多取一些用于后续衰减/重排)
             const searchK = useRerank ? Math.max(kSemantic * 2, 20) : kSemantic + 10;
@@ -2837,9 +2871,10 @@ class RAGDiaryPlugin {
 
         // 2. Rerank & Merge: 对处理后的结果进行最终精排与合并
         if (useTime && timeRanges && timeRanges.length > 0) {
-            // 🌟 V5.4: 在 Time 模式下，强制执行 60/40 分配，防止 TimeDecay 或高分语义结果导致时间轴逻辑失效
-            const kSemantic = Math.max(1, Math.ceil(finalK * 0.6));
-            const kTime = Math.max(1, finalK - kSemantic);
+            // 🌟 V5.4: 在 Time 模式下，强制执行语义/时间双路分配，防止 TimeDecay 或高分语义结果导致时间轴逻辑失效
+            // 默认 80/20；可用 ::Time0.1 / ::Time0.3 显式控制时间路比例。
+            const kTime = Math.max(1, Math.round(finalK * timeRatio));
+            const kSemantic = Math.max(1, finalK - kTime);
 
             const semanticCandidates = candidates.filter(c => c.source === 'rag');
             const timeCandidates = candidates.filter(c => c.source === 'time');
@@ -2991,10 +3026,13 @@ class RAGDiaryPlugin {
                     bm25Mode: bm25Mode,
                     bm25QueryTokens: bm25InfoForBroadcast?.queryTokens,
                     bm25MatchedCount: bm25InfoForBroadcast?.matchedCount,
+                    bm25Weight: bm25InfoForBroadcast?.bm25Weight,
+                    bm25VectorWeight: bm25InfoForBroadcast?.vectorWeight,
                     associateCount: useAssociate ? (finalResultsForBroadcast?.filter(r => r.source === 'associate').length || 0) : undefined,
                     useTagMemo: tagWeight !== null, // ✅ 添加Tag模式标识
                     tagWeight: tagWeight, // ✅ 添加Tag权重
                     coreTags: coreTagsForDisplay, // 🌟 广播中依然显示提取到的标签，方便观察
+                    timeRatio: useTime ? timeRatio : undefined,
                     timeRanges: (useTime && Array.isArray(timeRanges)) ? timeRanges.map(r => {
                         try {
                             return {
