@@ -3,33 +3,55 @@
 
 const http = require("http");
 const https = require("https");
-const net = require("net");
-const tls = require("tls");
+const { formatSearchResults } = require("./resultFormatter");
 
-const DEFAULT_ENDPOINT = "https://api.anysearch.com/mcp";
 const TIMEOUT_DEFAULT_MS = 30000;
 const TIMEOUT_MIN_MS = 1000;
-const TIMEOUT_MAX_MS = 120000;
+// VCP host kills this synchronous process at 45s; keep cleanup headroom.
+const TIMEOUT_MAX_MS = 40000;
 const MAX_RESULTS_MIN = 1;
 const MAX_RESULTS_MAX = 10;
 const BATCH_MAX = 5;
 const DOMAINS_MAX = 5;
-const RETRIES_DEFAULT = 5;
+
+// 能力级隐式路由：搜索固定走结构化 REST；目录查询、正文提取和维护同步走 MCP。
+const DEFAULT_SEARCH_ENDPOINT = "https://api.anysearch.com/v1/search";
+const DEFAULT_MCP_ENDPOINT = "https://api.anysearch.com/mcp";
 
 // Official AnySearch domains. Flow: pick the matching domain, call get_sub_domains(domain)
 // to learn its sub_domains + required params, then run a vertical `search`.
 const DOMAINS = [
-  "general", "resource", "social_media", "finance", "academic", "legal",
-  "health", "business", "security", "ip", "code", "energy",
-  "environment", "agriculture", "travel", "film", "gaming",
+  "general",
+  "resource",
+  "social_media",
+  "finance",
+  "academic",
+  "legal",
+  "health",
+  "business",
+  "security",
+  "ip",
+  "code",
+  "energy",
+  "environment",
+  "agriculture",
+  "travel",
+  "film",
+  "gaming",
 ];
 const DOMAIN_SET = new Set(DOMAINS);
 
 // 请求命令 -> JSON-RPC 工具名（仅大小写/连字符归一，不做旧名兼容）。
-const COMMANDS = new Set(["search", "get_sub_domains", "batch_search", "extract"]);
+const COMMANDS = new Set([
+  "search",
+  "get_sub_domains",
+  "batch_search",
+  "extract",
+]);
 
 process.stdin.setEncoding("utf8");
-if (process.stdout.setDefaultEncoding) process.stdout.setDefaultEncoding("utf8");
+if (process.stdout.setDefaultEncoding)
+  process.stdout.setDefaultEncoding("utf8");
 
 function emit(payload) {
   process.stdout.write(JSON.stringify(payload));
@@ -45,7 +67,9 @@ function fail(message) {
 function readStdin() {
   return new Promise((resolve) => {
     let input = "";
-    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("data", (chunk) => {
+      input += chunk;
+    });
     process.stdin.on("end", () => resolve(input.replace(/^﻿/, "")));
   });
 }
@@ -77,14 +101,18 @@ function normalizeCommand(payload) {
   if (raw) {
     const command = raw.toLowerCase().replace(/-/g, "_").trim();
     if (!COMMANDS.has(command)) {
-      fail("无效命令。可用命令：search、get_sub_domains、batch_search、extract。");
+      fail(
+        "无效命令。可用命令：search、get_sub_domains、batch_search、extract。"
+      );
     }
     return command;
   }
   // command 省略时按参数推断：有 queries 即批量，有 url（且无 query）即提取，否则搜索。
-  if (payload.queries !== undefined || payload.query_items !== undefined) return "batch_search";
+  if (payload.queries !== undefined || payload.query_items !== undefined)
+    return "batch_search";
   const hasQuery = !!firstString(payload, ["query", "q", "text", "Query"]);
-  if (!hasQuery && firstString(payload, ["url", "URL", "link"])) return "extract";
+  if (!hasQuery && firstString(payload, ["url", "URL", "link"]))
+    return "extract";
   return "search";
 }
 
@@ -96,32 +124,63 @@ function parseMaxResults(source) {
   return Math.max(MAX_RESULTS_MIN, Math.min(MAX_RESULTS_MAX, parsed));
 }
 
-// 子领域参数：首选纯文本 k=v,k2=v2（空值写 k=）；也接受对象 / JSON 对象字符串。
+// 子领域参数：首选纯文本 k=v,k2=v2（空值写 k=）；也接受对象 / JSON 对象字符串；
+// v3 对齐：额外兼容 PowerShell 风格 {k:v,k2:v2}（JSON.parse 失败时的容错路径）。
 function parseSubDomainParams(source) {
-  const value = source.params ?? source.sub_domain_params ?? source.subDomainParams ?? source.sdp;
+  const value =
+    source.params ??
+    source.sub_domain_params ??
+    source.subDomainParams ??
+    source.sdp;
   if (value === undefined || value === null || value === "") return undefined;
   if (typeof value === "object" && !Array.isArray(value)) return value;
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (!trimmed) return undefined;
     if (trimmed.startsWith("{")) {
+      // 先尝试标准 JSON
       try {
         const parsed = JSON.parse(trimmed);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
-      } catch (_) { /* fall through to the error below */ }
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed))
+          return parsed;
+      } catch (_) {
+        /* fall through to PowerShell-style parse */
+      }
+      // v3 对齐：PowerShell 风格 {k:v,k2:v2} 容错（不带引号的键值对）
+      const inner = trimmed.replace(/^\{|\}$/g, "").trim();
+      if (inner) {
+        const result = {};
+        let ok = true;
+        for (const pair of inner.split(",")) {
+          const item = pair.trim();
+          if (!item) continue;
+          const colon = item.indexOf(":");
+          if (colon <= 0) {
+            ok = false;
+            break;
+          }
+          result[item.slice(0, colon).trim()] = item.slice(colon + 1).trim();
+        }
+        if (ok && Object.keys(result).length > 0) return result;
+      }
     } else if (trimmed.includes("=")) {
       const result = {};
       for (const pair of trimmed.split(",")) {
         const item = pair.trim();
         if (!item) continue;
         const eq = item.indexOf("=");
-        if (eq <= 0) fail(`sub_domain_params 文本格式应为 k=v,k2=v2（空值写 k=），收到："${item}"。`);
+        if (eq <= 0)
+          fail(
+            `sub_domain_params 文本格式应为 k=v,k2=v2（空值写 k=），收到："${item}"。`
+          );
         result[item.slice(0, eq).trim()] = item.slice(eq + 1).trim();
       }
       return result;
     }
   }
-  fail("sub_domain_params 应为 k=v,k2=v2 文本（空值写 k=），或 JSON 对象。");
+  fail(
+    "sub_domain_params 应为 k=v,k2=v2 文本（空值写 k=），{k:v,k2:v2} 或 JSON 对象。"
+  );
 }
 
 function parseDomainList(value) {
@@ -147,80 +206,17 @@ function assertDomain(domain) {
   return domain;
 }
 
-// search 与 batch_search 查询项共用的选项解析。
-// domain 可省略：自动取 sub_domain 的「域.」前缀；显式给出且与前缀矛盾时报错。
-function buildSearchOptions(source) {
-  const options = {};
-  const subDomain = firstString(source, ["sub_domain", "subDomain", "subdomain"]);
-  let domain = firstString(source, ["domain", "Domain"]).toLowerCase();
-  if (subDomain) {
-    const prefix = subDomain.split(".")[0].toLowerCase();
-    if (domain && domain !== prefix) {
-      fail(`domain "${domain}" 与 sub_domain 前缀 "${prefix}" 不一致；domain 可直接省略。`);
-    }
-    domain = prefix;
-  }
-  if (domain) options.domain = assertDomain(domain);
-  if (subDomain) options.sub_domain = subDomain;
-
-  const subDomainParams = parseSubDomainParams(source);
-  if (subDomainParams) options.sub_domain_params = subDomainParams;
-
-  const maxResults = parseMaxResults(source);
-  if (maxResults !== undefined) options.max_results = maxResults;
-
-  return options;
-}
-
-function buildSearchArguments(payload) {
-  const query = firstString(payload, ["query", "q", "text", "Query"]);
-  if (!query) fail("search 缺少必填参数 query。");
-  return { query, ...buildSearchOptions(payload) };
-}
-
 function buildGetSubDomainsArguments(payload) {
   const domains = parseDomainList(payload.domains);
   if (domains.length > 0) {
-    if (domains.length > DOMAINS_MAX) fail(`domains 最多 ${DOMAINS_MAX} 个领域。`);
+    if (domains.length > DOMAINS_MAX)
+      fail(`domains 最多 ${DOMAINS_MAX} 个领域。`);
     domains.forEach(assertDomain);
     return { domains };
   }
   const domain = firstString(payload, ["domain", "Domain"]).toLowerCase();
   if (!domain) fail("get_sub_domains 需要 domain 或 domains 参数。");
   return { domain: assertDomain(domain) };
-}
-
-function buildBatchItem(item, shared) {
-  const source = typeof item === "string" ? { query: item } : item;
-  if (!source || typeof source !== "object" || Array.isArray(source)) {
-    fail("batch_search 的查询项必须是字符串或对象。");
-  }
-  const query = firstString(source, ["query", "q", "text", "Query"]);
-  if (!query) fail("batch_search 的每个查询项都需要 query。");
-  // Top-level (shared) options apply to every item; per-item fields override them.
-  return { ...shared, query, ...buildSearchOptions(source) };
-}
-
-function buildBatchSearchArguments(payload) {
-  const raw = payload.queries ?? payload.query_items;
-  if (raw === undefined || raw === null || raw === "") {
-    fail("batch_search 缺少必填参数 queries。");
-  }
-  let items = raw;
-  if (typeof raw === "string") {
-    const trimmed = raw.trim();
-    try {
-      items = JSON.parse(trimmed);
-    } catch (_) {
-      items = trimmed.split("|").map((s) => s.trim()).filter(Boolean);
-    }
-  }
-  if (!Array.isArray(items)) items = [items];
-  if (items.length < 1 || items.length > BATCH_MAX) {
-    fail(`batch_search 需要 1-${BATCH_MAX} 个查询。`);
-  }
-  const shared = buildSearchOptions(payload);
-  return { queries: items.map((item) => buildBatchItem(item, shared)) };
 }
 
 function buildExtractArguments(payload) {
@@ -230,10 +226,218 @@ function buildExtractArguments(payload) {
   return { url };
 }
 
+// v3 对齐：统一编译搜索任务 IR。把 VCP 输入编译成 1-5 个内部任务数组，
+// 供 executeSearchTasks 有界并发执行。三种模式：
+//   1. 单路：只有顶层 query，无编号字段 → 1 个任务
+//   2. 同路多词：queries（| 分隔），共享 sub_domain/params/max_results → N 个任务
+//   3. 自由路线：queryN/sub_domainN/paramsN/max_resultsN（N=1..5），继承顶层默认值
+// 规则：
+//   - queries 与编号字段混用 → 报错
+//   - 编号不连续 → 允许，按升序稳定输出
+//   - 只有 max_resultsN 没有 query/tag/params 差异 → 不创建路线
+//   - 每条路线最终必须有 query
+//   - 最多 5 路
+function compileSearchTasks(payload) {
+  const topQuery = firstString(payload, ["query", "q", "text", "Query"]);
+  const topSubDomain = firstString(payload, [
+    "sub_domain",
+    "subDomain",
+    "subdomain",
+  ]);
+  const topParams = parseSubDomainParams(payload);
+  const topMaxResults = parseMaxResults(payload);
+
+  // 检测编号字段
+  const numberedFields = [];
+  for (let i = 1; i <= 5; i++) {
+    const keys = [
+      `query${i}`,
+      `q${i}`,
+      `text${i}`,
+      `sub_domain${i}`,
+      `subDomain${i}`,
+      `params${i}`,
+      `sdp${i}`,
+      `max_results${i}`,
+    ];
+    if (
+      keys.some(
+        (k) =>
+          payload[k] !== undefined && payload[k] !== null && payload[k] !== ""
+      )
+    ) {
+      numberedFields.push(i);
+    }
+  }
+
+  // 检测 queries
+  const hasQueries =
+    payload.queries !== undefined || payload.query_items !== undefined;
+
+  // 规则：queries 与编号字段混用 → 报错
+  if (hasQueries && numberedFields.length > 0) {
+    fail(
+      "queries 与编号字段（query1/sub_domain1 等）不能混用；请选择一种编排方式。"
+    );
+  }
+
+  // 模式 2：同路多词（queries）
+  if (hasQueries) {
+    const raw = payload.queries ?? payload.query_items;
+    let items = raw;
+    if (typeof raw === "string") {
+      const trimmed = raw.trim();
+      try {
+        items = JSON.parse(trimmed);
+      } catch (_) {
+        items = trimmed
+          .split("|")
+          .map((s) => s.trim())
+          .filter(Boolean);
+      }
+    }
+    if (!Array.isArray(items)) items = [items];
+    if (items.length < 1 || items.length > BATCH_MAX) {
+      fail(`queries 需要 1-${BATCH_MAX} 个查询。`);
+    }
+    // 每个查询共享顶层 sub_domain/params/max_results
+    return items.map((item, idx) => {
+      const query =
+        typeof item === "string"
+          ? item.trim()
+          : firstString(item, ["query", "q", "text", "Query"]);
+      if (!query) fail(`queries 的第 ${idx + 1} 项缺少 query。`);
+      const task = { routeIndex: idx, query };
+      if (topSubDomain) task.sub_domain = topSubDomain;
+      if (topParams) task.params = topParams;
+      if (topMaxResults !== undefined) task.max_results = topMaxResults;
+      return task;
+    });
+  }
+
+  // 模式 3：自由路线编排（编号字段）
+  if (numberedFields.length > 0) {
+    const tasks = [];
+    for (const i of numberedFields) {
+      const query = firstString(payload, [`query${i}`, `q${i}`, `text${i}`]);
+      const subDomain = firstString(payload, [
+        `sub_domain${i}`,
+        `subDomain${i}`,
+      ]);
+      const params = parseSubDomainParams({
+        params: payload[`params${i}`],
+        sdp: payload[`sdp${i}`],
+        sub_domain_params: payload[`sub_domain_params${i}`],
+      });
+      const maxResults = parseMaxResults({
+        max_results: payload[`max_results${i}`],
+        maxResults: payload[`maxResults${i}`],
+      });
+
+      // 继承顶层默认值
+      const finalQuery = query || topQuery;
+      const finalSubDomain = subDomain || topSubDomain;
+      const finalParams = params || topParams;
+      const finalMaxResults =
+        maxResults !== undefined ? maxResults : topMaxResults;
+
+      // 只有 max_resultsN 没有 query/tag/params 差异 → 不创建路线
+      // 即：编号字段只提供了 max_resultsN，且无顶层 query 可继承
+      const hasOverride = query || subDomain || params;
+      if (!hasOverride && !topQuery) {
+        continue; // 空路线：只有 max_resultsN，无 query 可继承
+      }
+      if (!finalQuery) {
+        fail(`路线 ${i} 缺少 query（顶层或编号 query${i} 均未提供）。`);
+      }
+
+      const task = { routeIndex: i, query: finalQuery };
+      if (finalSubDomain) task.sub_domain = finalSubDomain;
+      if (finalParams) task.params = finalParams;
+      if (finalMaxResults !== undefined) task.max_results = finalMaxResults;
+      tasks.push(task);
+    }
+    if (tasks.length === 0) fail("自由路线编排未产生任何有效路线。");
+    if (tasks.length > BATCH_MAX) fail(`自由路线编排最多 ${BATCH_MAX} 路。`);
+    return tasks;
+  }
+
+  // 模式 1：单路搜索
+  if (!topQuery) fail("search 缺少必填参数 query。");
+  const task = { routeIndex: 0, query: topQuery };
+  if (topSubDomain) task.sub_domain = topSubDomain;
+  if (topParams) task.params = topParams;
+  if (topMaxResults !== undefined) task.max_results = topMaxResults;
+  return [task];
+}
+
+// 1-5 路搜索使用非阻塞 HTTP 并发；单路失败不取消其他路线，不重试 429。
+// 搜索固定走 REST，以保持结构化裁剪、全局去重和稳定输出契约。
+function normalizeMcpToolResponse(response) {
+  if (!response.ok) return response;
+  const data = response.data || {};
+  if (data.error) {
+    return {
+      ...response,
+      ok: false,
+      error: data.error.message || "MCP 工具返回错误",
+      requestId: data.error.data?.request_id || response.requestId,
+    };
+  }
+
+  const result = data.result || {};
+  const content = Array.isArray(result.content) ? result.content : [];
+  const text = content
+    .filter(
+      (item) => item && item.type === "text" && typeof item.text === "string"
+    )
+    .map((item) => item.text)
+    .join("\n\n");
+  const requestId = result.request_id || data.request_id || response.requestId;
+  if (result.isError) {
+    return {
+      ...response,
+      ok: false,
+      error: text || "MCP 工具返回 isError: true",
+      requestId,
+    };
+  }
+  return { ...response, mcpText: text, requestId };
+}
+
+function executeSearchTasks(tasks) {
+  const timeoutMs = getTimeoutMs();
+  const endpoint = getSearchEndpoint();
+  const promises = tasks.map((task) => {
+    const body = { query: task.query };
+    if (task.sub_domain) body.tag = task.sub_domain;
+    if (task.params) body.params = task.params;
+    if (task.max_results !== undefined) body.max_results = task.max_results;
+
+    return postJson(endpoint, JSON.stringify(body), { timeoutMs }).then(
+      (result) => ({
+        routeIndex: task.routeIndex,
+        ...result,
+      })
+    );
+  });
+
+  return Promise.allSettled(promises).then((results) =>
+    results.map((result, index) =>
+      result.status === "fulfilled"
+        ? result.value
+        : {
+            routeIndex: tasks[index].routeIndex,
+            ok: false,
+            error: result.reason?.message || String(result.reason),
+            statusCode: 0,
+          }
+    )
+  );
+}
+
 const ARGUMENT_BUILDERS = {
-  search: buildSearchArguments,
   get_sub_domains: buildGetSubDomainsArguments,
-  batch_search: buildBatchSearchArguments,
   extract: buildExtractArguments,
 };
 
@@ -252,9 +456,30 @@ function getTimeoutMs() {
   return Math.max(TIMEOUT_MIN_MS, Math.min(TIMEOUT_MAX_MS, parsed));
 }
 
+// 搜索 endpoint：未配置时使用官方 /v1/search。
+function getSearchEndpoint() {
+  return (
+    (process.env.ANYSEARCH_SEARCH_ENDPOINT || DEFAULT_SEARCH_ENDPOINT).trim() ||
+    DEFAULT_SEARCH_ENDPOINT
+  );
+}
+
+// MCP endpoint：新变量优先；旧 ANYSEARCH_ENDPOINT 作为兼容别名保留一个版本周期；都没有时用官方 /mcp。
+function getMcpEndpoint() {
+  const mcp = (process.env.ANYSEARCH_MCP_ENDPOINT || "").trim();
+  if (mcp) return mcp;
+  const legacy = (process.env.ANYSEARCH_ENDPOINT || "").trim();
+  if (legacy) return legacy;
+  return DEFAULT_MCP_ENDPOINT;
+}
+
 function isLoopback(hostname) {
-  return hostname === "127.0.0.1" || hostname === "localhost" ||
-    hostname === "::1" || hostname === "[::1]";
+  return (
+    hostname === "127.0.0.1" ||
+    hostname === "localhost" ||
+    hostname === "::1" ||
+    hostname === "[::1]"
+  );
 }
 
 // Production endpoints must be HTTPS so the Bearer key is never sent in cleartext.
@@ -266,423 +491,191 @@ function resolveTransport(url) {
   fail("ANYSEARCH_ENDPOINT 必须是 https:// 地址（http:// 仅允许 127.0.0.1）。");
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 代理池支持（HTTP CONNECT + SOCKS5 隧道）+ 轮换重试机制
-// ═══════════════════════════════════════════════════════════════
+// v3 对齐：统一的 POST + JSON 请求函数。供 REST 搜索和 MCP 工具调用共用。
+// 安全规则：
+// - URL 必须 https（loopback 除外）；非法协议直接 fail。
+// - 错误文本不拼接完整 headers、完整 Authorization、完整请求体或完整响应原文。
+// - 非 JSON 响应只取前 200 字符并做基础脱敏，避免把 HTML/网关错误页里的 token 回显。
+// - 429 不重试（由调用方决定如何呈现），本函数只负责一次请求的完整错误语义。
+// 返回：{ ok: true, data, statusCode } 或 { ok: false, error, statusCode, requestId }。
+function postJson(endpoint, body, options) {
+  const opts = options || {};
+  const timeoutMs = opts.timeoutMs || getTimeoutMs();
+  const sendAuth = opts.sendAuth !== false; // 默认注入 Authorization
 
-/**
- * 解析单个代理 URL。
- * 支持 http://host:port (HTTP CONNECT) 和 socks5://host:port (SOCKS5)。
- * 无协议前缀时默认 http。
- * @returns {{type:"http"|"socks5",host:string,port:number}}
- */
-function parseProxyUrl(str) {
-  let url;
-  try {
-    if (!/^[a-z]+:\/\//i.test(str)) str = "http://" + str;
-    url = new URL(str);
-  } catch (_) {
-    fail(`ANYSEARCH_PROXY 中 "${str}" 不是合法 URL。`);
-  }
-  const type = url.protocol === "socks5:" ? "socks5" : "http";
-  const host = url.hostname;
-  if (!host) fail(`ANYSEARCH_PROXY 中 "${str}" 缺少 hostname。`);
-  const port = parseInt(url.port, 10) || (type === "socks5" ? 1080 : 80);
-  return { type, host, port };
-}
-
-/**
- * 解析 ANYSEARCH_PROXY 环境变量为代理池。
- * 支持逗号分隔多个代理地址，实现故障转移和负载轮换。
- * @returns {Array<{type:string,host:string,port:number}>}
- */
-function getProxyPool() {
-  const proxyStr = (process.env.ANYSEARCH_PROXY || "").trim();
-  if (!proxyStr) return [];
-  return proxyStr
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map(parseProxyUrl);
-}
-
-/**
- * 公共 JSON-RPC 响应解析（直连与代理路径共用）。
- */
-function parseJsonRpcResponse(raw, statusCode) {
-  let data;
-  try {
-    data = JSON.parse(raw);
-  } catch (_) {
-    throw new Error(`API 返回了非 JSON 响应：${raw.slice(0, 500)}`);
-  }
-  if (statusCode >= 400) {
-    throw new Error(`HTTP ${statusCode}: ${JSON.stringify(data)}`);
-  }
-  if (data.error) {
-    throw new Error(data.error.message || JSON.stringify(data.error));
-  }
-  const result = data.result || {};
-  const content = Array.isArray(result.content) ? result.content : [];
-  const textItem = content.find((item) => item && item.type === "text");
-  return textItem ? textItem.text : JSON.stringify(result, null, 2);
-}
-
-/**
- * 构建 JSON-RPC 请求 body + headers（直连与代理共用）。
- */
-function buildRequestPayload(toolName, args) {
-  const body = JSON.stringify({
-    jsonrpc: "2.0",
-    id: 1,
-    method: "tools/call",
-    params: { name: toolName, arguments: args },
-  });
-  const headers = {
-    "Content-Type": "application/json",
-    "Content-Length": Buffer.byteLength(body),
-  };
-  const apiKey = pickApiKey();
-  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  return { body, headers };
-}
-
-/**
- * 解码 HTTP chunked transfer encoding。
- */
-function dechunk(body) {
-  let result = "";
-  let pos = 0;
-  while (pos < body.length) {
-    const lineEnd = body.indexOf("\r\n", pos);
-    if (lineEnd < 0) break;
-    const sizeHex = body.slice(pos, lineEnd).trim();
-    const size = parseInt(sizeHex, 16);
-    if (isNaN(size) || size === 0) break;
-    pos = lineEnd + 2;
-    result += body.slice(pos, pos + size);
-    pos += size + 2;
-  }
-  return result || body;
-}
-
-/**
- * 建立 HTTP CONNECT 隧道。
- * @returns {Promise<{sock:net.Socket}>}
- */
-function establishHttpConnect(proxy, targetHost, targetPort) {
-  return new Promise((resolve, reject) => {
-    const sock = net.connect(proxy.port, proxy.host);
-    sock.setTimeout(15000);
-    let buf = "";
-
-    sock.on("connect", () => {
-      sock.write(
-        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
-        `Host: ${targetHost}:${targetPort}\r\n\r\n`
-      );
-    });
-
-    sock.on("data", function onConnectData(d) {
-      buf += d.toString("binary");
-      if (!buf.includes("\r\n\r\n")) return;
-      sock.removeListener("data", onConnectData);
-
-      const firstLine = buf.split("\r\n")[0];
-      if (!firstLine.includes("200")) {
-        sock.destroy();
-        reject(new Error(`HTTP 代理 CONNECT 失败: ${firstLine.trim()}`));
-        return;
-      }
-      // TLS 握手由 tls.connect 从底层 socket 自动读取，无需手动注入残留数据
-      resolve({ sock });
-    });
-
-    sock.on("timeout", () => {
-      sock.destroy();
-      reject(new Error("HTTP 代理连接超时。"));
-    });
-    sock.on("error", (e) => reject(e));
-  });
-}
-
-// SOCKS5 错误码映射（RFC 1928 §6）
-const SOCKS5_ERRORS = {
-  1: "一般性失败",
-  2: "规则不允许连接",
-  3: "网络不可达",
-  4: "主机不可达",
-  5: "连接被拒绝",
-  6: "TTL 过期",
-  7: "不支持的 CONNECT 命令",
-  8: "不支持的地址类型",
-};
-
-/**
- * 建立 SOCKS5 隧道（RFC 1928）。
- * 仅支持无认证模式（0x00），不支持用户名/密码认证。
- * @returns {Promise<{sock:net.Socket}>}
- */
-function establishSocks5(proxy, targetHost, targetPort) {
-  return new Promise((resolve, reject) => {
-    const sock = net.connect(proxy.port, proxy.host);
-    sock.setTimeout(15000);
-    let phase = "negotiate"; // negotiate → connect → done
-
-    sock.on("connect", () => {
-      // SOCKS5 版本协商：版本 5，1 种认证方法，无认证 (0x00)
-      sock.write(Buffer.from([0x05, 0x01, 0x00]));
-    });
-
-    sock.on("data", function onData(d) {
-      if (phase === "negotiate") {
-        if (d.length < 2 || d[0] !== 0x05) {
-          sock.destroy();
-          reject(new Error("SOCKS5 协商失败：代理返回了无效响应。"));
-          return;
-        }
-        if (d[1] !== 0x00) {
-          sock.destroy();
-          reject(new Error(`SOCKS5 代理要求认证（方法 0x${d[1].toString(16)}），暂不支持。`));
-          return;
-        }
-        phase = "connect";
-        // 发送 CONNECT 请求（域名类型 0x03）
-        const hostBuf = Buffer.from(targetHost, "ascii");
-        const req = Buffer.alloc(7 + hostBuf.length);
-        req[0] = 0x05; // SOCKS 版本
-        req[1] = 0x01; // CONNECT 命令
-        req[2] = 0x00; // 保留
-        req[3] = 0x03; // 地址类型：域名
-        req[4] = hostBuf.length;
-        hostBuf.copy(req, 5);
-        req.writeUInt16BE(targetPort, 5 + hostBuf.length);
-        sock.write(req);
-        return;
-      }
-
-      if (phase === "connect") {
-        if (d.length < 4 || d[0] !== 0x05) {
-          sock.destroy();
-          reject(new Error("SOCKS5 CONNECT 响应无效。"));
-          return;
-        }
-        if (d[1] !== 0x00) {
-          sock.destroy();
-          const desc = SOCKS5_ERRORS[d[1]] || `错误码 ${d[1]}`;
-          reject(new Error(`SOCKS5 CONNECT 失败: ${desc}。`));
-          return;
-        }
-        phase = "done";
-        sock.removeListener("data", onData);
-        resolve({ sock });
-        return;
-      }
-    });
-
-    sock.on("timeout", () => {
-      sock.destroy();
-      reject(new Error("SOCKS5 代理连接超时。"));
-    });
-    sock.on("error", (e) => reject(e));
-  });
-}
-
-/**
- * 在已建立的隧道上执行 TLS 握手 + HTTP POST 请求。
- * HTTP CONNECT 和 SOCKS5 共用此函数。
- */
-function callViaTunnel(toolName, args, tunnelResult, targetUrl) {
-  const { body, headers } = buildRequestPayload(toolName, args);
-  const targetHost = targetUrl.hostname;
-  const targetPort = targetUrl.port || 443;
-  const targetPath = `${targetUrl.pathname}${targetUrl.search}`;
-  const timeoutMs = getTimeoutMs();
-
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const done = (fn, val) => { if (!settled) { settled = true; fn(val); } };
-    const { sock } = tunnelResult;
-
-    const tlsSock = tls.connect(
-      { socket: sock, servername: targetHost, rejectUnauthorized: true },
-      () => {
-        const httpReq =
-          `POST ${targetPath} HTTP/1.1\r\n` +
-          `Host: ${targetHost}\r\n` +
-          `Content-Type: application/json\r\n` +
-          `Content-Length: ${Buffer.byteLength(body)}\r\n` +
-          (headers.Authorization ? `Authorization: ${headers.Authorization}\r\n` : "") +
-          `Connection: close\r\n\r\n` +
-          body;
-        tlsSock.write(httpReq);
-      }
-    );
-
-    let resp = "";
-    tlsSock.setEncoding("utf8");
-    tlsSock.on("data", (chunk) => { resp += chunk; });
-    tlsSock.on("end", () => {
-      const sep = resp.indexOf("\r\n\r\n");
-      if (sep < 0) {
-        done(reject, new Error("代理路径返回的 HTTP 响应格式异常。"));
-        return;
-      }
-      const headerBlock = resp.slice(0, sep);
-      const statusLine = headerBlock.split("\r\n")[0];
-      const statusCode = parseInt(statusLine.split(" ")[1], 10) || 0;
-      let respBody = resp.slice(sep + 4);
-      if (/transfer-encoding:\s*chunked/i.test(headerBlock)) {
-        respBody = dechunk(respBody);
-      }
-      try { done(resolve, parseJsonRpcResponse(respBody, statusCode)); }
-      catch (e) { done(reject, e); }
-    });
-    tlsSock.on("error", (e) => done(reject, e));
-    tlsSock.setTimeout(timeoutMs, () => {
-      tlsSock.destroy();
-      done(reject, new Error("API 请求超时。"));
-    });
-  });
-}
-
-/**
- * 直连请求（不走代理）。
- */
-function callAnySearchDirect(toolName, args) {
-  const endpoint = (process.env.ANYSEARCH_ENDPOINT || DEFAULT_ENDPOINT).trim() || DEFAULT_ENDPOINT;
   let url;
   try {
     url = new URL(endpoint);
   } catch (_) {
-    fail("ANYSEARCH_ENDPOINT 不是合法 URL。");
+    return Promise.resolve({
+      ok: false,
+      error: "endpoint 不是合法 URL。",
+      statusCode: 0,
+    });
   }
   const transport = resolveTransport(url);
-  const { body, headers } = buildRequestPayload(toolName, args);
-  const timeoutMs = getTimeoutMs();
 
-  return new Promise((resolve, reject) => {
-    const req = transport.request(
-      {
-        hostname: url.hostname,
-        port: url.port || (url.protocol === "http:" ? 80 : 443),
-        path: `${url.pathname}${url.search}`,
-        method: "POST",
-        headers,
-      },
-      (res) => {
-        let data = "";
-        res.setEncoding("utf8");
-        res.on("data", (chunk) => { data += chunk; });
-        res.on("end", () => {
-          try { resolve(parseJsonRpcResponse(data, res.statusCode || 0)); }
-          catch (e) { reject(e); }
-        });
-      }
-    );
-    req.on("error", reject);
-    req.setTimeout(timeoutMs, () => {
+  const headers = {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(body),
+    "X-Anysearch-Client": "vcp-anysearch/3.0.1",
+  };
+  if (sendAuth) {
+    const apiKey = pickApiKey();
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  }
+
+  const reqOptions = {
+    hostname: url.hostname,
+    port: url.port || (url.protocol === "http:" ? 80 : 443),
+    path: `${url.pathname}${url.search}`,
+    method: "POST",
+    headers,
+  };
+
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    const req = transport.request(reqOptions, (res) => {
+      let raw = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        raw += chunk;
+      });
+      res.on("end", () => {
+        const statusCode = res.statusCode || 0;
+        const requestId = (res.headers && res.headers["x-request-id"]) || "";
+
+        // 非 JSON 响应：网关错误页/HTML，只取前 200 字符并移除可能的 token 片段
+        let data;
+        try {
+          data = JSON.parse(raw);
+        } catch (_) {
+          const snippet = raw
+            .slice(0, 200)
+            .replace(/[A-Za-z0-9_-]{20,}/g, "[redacted]");
+          finish({
+            ok: false,
+            error: `API 返回了非 JSON 响应（HTTP ${statusCode}）：${snippet}`,
+            statusCode,
+            requestId,
+          });
+          return;
+        }
+
+        // HTTP 4xx/5xx：只保留 code 和 message，不回显完整响应体
+        if (statusCode >= 400) {
+          const msg =
+            (data && data.message) ||
+            (data && data.error && data.error.message) ||
+            `HTTP ${statusCode}`;
+          finish({
+            ok: false,
+            error: `HTTP ${statusCode}：${msg}`,
+            statusCode,
+            requestId,
+            data,
+          });
+          return;
+        }
+
+        // REST 业务错误：HTTP 200 但 code !== 0（AnySearch REST 约定 code=0 成功）
+        // 注意：MCP JSON-RPC 响应没有顶层 code 字段，不会误判
+        if (data && typeof data.code === "number" && data.code !== 0) {
+          const msg = (data && data.message) || `code=${data.code}`;
+          finish({
+            ok: false,
+            error: msg,
+            statusCode,
+            requestId: data.request_id || requestId,
+            data,
+          });
+          return;
+        }
+
+        finish({ ok: true, data, statusCode, requestId });
+      });
+    });
+
+    // 超时：直接 resolve 超时错误并销毁请求。用 finish 保证只 resolve 一次，
+    // 避免 req.destroy 触发的 error 事件和 timeout 回调双重 resolve。
+    const timer = setTimeout(() => {
       req.destroy();
-      reject(new Error("API 请求超时。"));
+      finish({ ok: false, error: "API 请求超时。", statusCode: 0 });
+    }, timeoutMs);
+
+    req.on("error", (err) => {
+      finish({ ok: false, error: err.message || String(err), statusCode: 0 });
     });
     req.write(body);
     req.end();
   });
 }
 
-/**
- * 通过指定代理发送请求（HTTP CONNECT 或 SOCKS5）。
- */
-async function callAnySearchViaProxy(toolName, args, proxy) {
-  const endpoint = (process.env.ANYSEARCH_ENDPOINT || DEFAULT_ENDPOINT).trim() || DEFAULT_ENDPOINT;
-  let targetUrl;
-  try {
-    targetUrl = new URL(endpoint);
-  } catch (_) {
-    fail("ANYSEARCH_ENDPOINT 不是合法 URL。");
-  }
-  if (targetUrl.protocol !== "https:") {
-    fail("使用代理时 ANYSEARCH_ENDPOINT 必须是 https:// 地址。");
-  }
-
-  const targetHost = targetUrl.hostname;
-  const targetPort = targetUrl.port || 443;
-
-  // 根据代理类型建立隧道
-  const tunnelResult = proxy.type === "socks5"
-    ? await establishSocks5(proxy, targetHost, targetPort)
-    : await establishHttpConnect(proxy, targetHost, targetPort);
-
-  return callViaTunnel(toolName, args, tunnelResult, targetUrl);
-}
-
-/**
- * Dispatcher：根据代理配置 + 当前尝试次数选择请求路径。
- * 每次重试轮换到代理池中的下一个代理。
- */
-function callAnySearch(toolName, args, proxyPool, attempt) {
-  if (!proxyPool) proxyPool = getProxyPool();
-
-  // loopback endpoint 强制直连
-  const endpoint = (process.env.ANYSEARCH_ENDPOINT || DEFAULT_ENDPOINT).trim() || DEFAULT_ENDPOINT;
-  try {
-    const url = new URL(endpoint);
-    if (url.protocol === "http:" && isLoopback(url.hostname)) {
-      return callAnySearchDirect(toolName, args);
-    }
-  } catch (_) { /* endpoint 格式错误由 Direct 路径报 */ }
-
-  if (proxyPool.length === 0) return callAnySearchDirect(toolName, args);
-
-  // 轮换代理：attempt 从 1 开始，按代理池长度取模
-  const proxy = proxyPool[(attempt - 1) % proxyPool.length];
-  return callAnySearchViaProxy(toolName, args, proxy);
-}
-
-/**
- * 重试包装：仅对网络层错误重试（超时、连接重置、TLS 失败等）。
- * 业务错误（HTTP 4xx、API error）不重试。
- * 每次重试自动轮换到代理池中的下一个代理。
- */
-function callAnySearchWithRetry(toolName, args) {
-  const maxRetries = parseInt(process.env.ANYSEARCH_MAX_RETRIES || "", 10) || RETRIES_DEFAULT;
-  const proxyPool = getProxyPool();
-
-  return new Promise((resolve, reject) => {
-    let attempt = 0;
-    const tryOnce = () => {
-      attempt++;
-      callAnySearch(toolName, args, proxyPool, attempt).then(resolve).catch((error) => {
-        const msg = error.message || String(error);
-        const isNetworkError = /超时|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|socket hang up|代理.*失败|代理.*超时|TLS|disconnected|SOCKS5|CONNECT 失败|响应格式异常/i.test(msg);
-        if (!isNetworkError || attempt >= maxRetries) {
-          reject(error);
-          return;
-        }
-        const nextProxy = proxyPool.length > 0
-          ? proxyPool[attempt % proxyPool.length]
-          : null;
-        if (nextProxy) {
-          process.stderr.write(`[AnySearch] 第 ${attempt}/${maxRetries} 次尝试失败（${msg.slice(0, 80)}），切换到代理 ${nextProxy.type}://${nextProxy.host}:${nextProxy.port}\n`);
-        }
-        tryOnce();
-      });
-    };
-    tryOnce();
+function callAnySearch(toolName, args) {
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: toolName, arguments: args },
   });
+
+  return postJson(getMcpEndpoint(), body)
+    .then(normalizeMcpToolResponse)
+    .then((response) => {
+      if (!response.ok) throw new Error(response.error || "MCP 请求失败");
+      return (
+        response.mcpText || JSON.stringify(response.data?.result || {}, null, 2)
+      );
+    });
+}
+
+// v3 对齐：extract 内容截断。50,000 字符硬上限，避免超长页面无界回灌。
+const EXTRACT_MAX_CHARS = 50000;
+function truncateExtractContent(text) {
+  if (typeof text !== "string") return "";
+  if (text.length <= EXTRACT_MAX_CHARS) return text;
+  const notice = "\n\n...(内容已截断，达到 50,000 字符上限)...";
+  return text.slice(0, EXTRACT_MAX_CHARS - notice.length) + notice;
 }
 
 async function main() {
   try {
     const payload = parsePayload(await readStdin());
     const command = normalizeCommand(payload);
+
+    // v3 对齐：search 和 batch_search 走新的编译+并发+裁剪路径
+    if (command === "search" || command === "batch_search") {
+      const tasks = compileSearchTasks(payload);
+      const routeResults = await executeSearchTasks(tasks);
+      const text = formatSearchResults(routeResults);
+      emit({
+        status: "success",
+        result: { content: [{ type: "text", text }] },
+      });
+      return;
+    }
+
+    // get_sub_domains 和 extract 继续走 MCP
     const args = ARGUMENT_BUILDERS[command](payload);
-    const content = await callAnySearchWithRetry(command, args);
-    const text = typeof content === "string" && content.trim()
-      ? content.trim()
-      : "AnySearch API 未返回可读文本内容。";
-    // 富内容形态：server 的 _formatResult 会直接取 text，AI 收到干净 Markdown，
-    // 不会被包进 original_plugin_output 的 JSON 转义串。
+    const content = await callAnySearch(command, args);
+
+    // v3 对齐：extract 截断 50k
+    const text =
+      command === "extract"
+        ? truncateExtractContent(
+            typeof content === "string" ? content.trim() : ""
+          )
+        : typeof content === "string" && content.trim()
+        ? content.trim()
+        : "AnySearch API 未返回可读文本内容。";
+
     emit({ status: "success", result: { content: [{ type: "text", text }] } });
   } catch (error) {
     fail(error.message || String(error));
