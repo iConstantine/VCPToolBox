@@ -292,14 +292,20 @@ async function _handleOrganizeInternal(args) {
         const processedContent = processTags(contentText, tag);
 
         const trimmedMaidName = maid.trim();
-        let folderName = trimmedMaidName;
-        let actualMaidName = trimmedMaidName;
-        const tagMatch = trimmedMaidName.match(/^\[(.*?)\](.*)$/);
+        const trimmedFolderName = typeof folder === 'string' ? folder.trim() : '';
+        // 解析旧式 [文件夹]作者 格式——闭括号后必须有非空作者名才视为旧格式
+        const tagMatch = trimmedMaidName.match(/^\[([^\]]*)\](.+)$/);
+        let folderName;
+        let actualMaidName;
 
         if (tagMatch) {
-            folderName = tagMatch[1].trim();
             actualMaidName = tagMatch[2].trim();
-            debugLog(`Tagged note: folder=${folderName}, maid=${actualMaidName}`);
+            folderName = trimmedFolderName || tagMatch[1].trim() || actualMaidName;
+            debugLog(`Legacy maid format parsed for organize. Folder: ${folderName}, Actual Maid: ${actualMaidName}, explicit folder: ${!!trimmedFolderName}`);
+        } else {
+            actualMaidName = trimmedMaidName;
+            folderName = trimmedFolderName || trimmedMaidName;
+            debugLog(`Plain maid for organize. Folder: ${folderName}, Actual Maid: ${actualMaidName}`);
         }
 
         const sanitizedFolderName = sanitizePathComponent(folderName);
