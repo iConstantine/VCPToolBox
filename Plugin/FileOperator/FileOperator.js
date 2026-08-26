@@ -38,16 +38,40 @@ function debugLog(message, data = null) {
 }
 
 /**
- * Get a path-like parameter with AI-friendly fallbacks.
- * Supports canonical names such as filePath/directoryPath/sourcePath/destinationPath/searchPath,
- * while also accepting generic path/Path to tolerate mixed tool-call field naming.
+ * Get a parameter value with AI-friendly fallbacks.
+ * Searches candidate names in order, then falls back to case-insensitive matching.
  */
-function getPathParameter(parameters, canonicalName) {
+function getParameterValue(parameters, ...candidateNames) {
   if (!parameters || typeof parameters !== 'object') {
     return undefined;
   }
 
-  return parameters[canonicalName] ?? parameters.path ?? parameters.Path;
+  for (const name of candidateNames) {
+    if (Object.prototype.hasOwnProperty.call(parameters, name) && parameters[name] !== undefined) {
+      return parameters[name];
+    }
+  }
+
+  const normalizedCandidateNames = candidateNames.map(name => String(name).toLowerCase());
+  for (const [key, value] of Object.entries(parameters)) {
+    if (value !== undefined && normalizedCandidateNames.includes(key.toLowerCase())) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function getPathParameter(parameters, ...legacyNames) {
+  return getParameterValue(parameters, 'path', 'filePath', 'directoryPath', 'searchPath', ...legacyNames);
+}
+
+function getSourcePathParameter(parameters) {
+  return getParameterValue(parameters, 'source', 'sourcePath');
+}
+
+function getDestinationPathParameter(parameters) {
+  return getParameterValue(parameters, 'destination', 'destinationPath');
 }
 
 function isPathAllowed(targetPath, operationType = 'generic') {
@@ -96,82 +120,82 @@ function formatFileSize(bytes) {
  * @returns {Object} Object containing normalization and restoration methods
  */
 function createLineEndingHelper(content) {
-    const crlfCount = (content.match(/\r\n/g) || []).length;
+  const crlfCount = (content.match(/\r\n/g) || []).length;
 
-    // Improved LF counting: [^\r]\n handles most cases, plus check file start
-    let lfCount = (content.match(/[^\r]\n/g) || []).length;
-    if (content.startsWith('\n')) {
-        lfCount += 1;
-    }
+  // Improved LF counting: [^\r]\n handles most cases, plus check file start
+  let lfCount = (content.match(/[^\r]\n/g) || []).length;
+  if (content.startsWith('\n')) {
+    lfCount += 1;
+  }
 
-    const crCount = (content.match(/\r(?!\n)/g) || []).length;
+  const crCount = (content.match(/\r(?!\n)/g) || []).length;
 
-    let lineEnding = '\n';
-    if (crlfCount > lfCount && crlfCount > crCount) {
-        lineEnding = '\r\n';
-    } else if (crCount > lfCount && crCount > crlfCount) {
-        lineEnding = '\r';
-    }
+  let lineEnding = '\n';
+  if (crlfCount > lfCount && crlfCount > crCount) {
+    lineEnding = '\r\n';
+  } else if (crCount > lfCount && crCount > crlfCount) {
+    lineEnding = '\r';
+  }
 
-    const hasCRLF = crlfCount > 0;
+  const hasCRLF = crlfCount > 0;
 
-    if (DEBUG_MODE) {
-        console.error(`[CRLF Detect] CRLF=${crlfCount}, LF=${lfCount}, CR=${crCount}, using=${JSON.stringify(lineEnding)}`);
-    }
+  if (DEBUG_MODE) {
+    console.error(`[CRLF Detect] CRLF=${crlfCount}, LF=${lfCount}, CR=${crCount}, using=${JSON.stringify(lineEnding)}`);
+  }
 
-    return {
-        normalize: (str) => str.replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
+  return {
+    normalize: (str) => str.replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
 
-        denormalize: (str) => {
-            if (lineEnding === '\r\n') {
-                return str.replace(/\n/g, '\r\n');
-            } else if (lineEnding === '\r') {
-                return str.replace(/\n/g, '\r');
-            }
-            return str;
-        },
+    denormalize: (str) => {
+      if (lineEnding === '\r\n') {
+        return str.replace(/\n/g, '\r\n');
+      } else if (lineEnding === '\r') {
+        return str.replace(/\n/g, '\r');
+      }
+      return str;
+    },
 
-        includes: (cnt, search) => {
-            const normContent = cnt.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-            const normSearch = search.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-            return normContent.includes(normSearch);
-        },
+    includes: (cnt, search) => {
+      const normContent = cnt.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      const normSearch = search.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      return normContent.includes(normSearch);
+    },
 
-        safeReplace: (originalContent, searchStr, replaceStr) => {
-            const normContent = originalContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-            const normSearch = searchStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-            const normReplace = replaceStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    safeReplace: (originalContent, searchStr, replaceStr) => {
+      const normContent = originalContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      const normSearch = searchStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+      const normReplace = replaceStr.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-            if (!normContent.includes(normSearch)) {
-                return {
-                    success: false,
-                    error: 'Search string not found after CRLF normalization'
-                };
-            }
+      if (!normContent.includes(normSearch)) {
+        return {
+          success: false,
+          error: 'Search string not found after CRLF normalization'
+        };
+      }
 
-            const normResult = normContent.replace(normSearch, normReplace);
+      const normResult = normContent.replace(normSearch, normReplace);
 
-            let result = normResult;
-            if (lineEnding === '\r\n') {
-                result = normResult.replace(/\n/g, '\r\n');
-            } else if (lineEnding === '\r') {
-                result = normResult.replace(/\n/g, '\r');
-            }
+      let result = normResult;
+      if (lineEnding === '\r\n') {
+        result = normResult.replace(/\n/g, '\r\n');
+      } else if (lineEnding === '\r') {
+        result = normResult.replace(/\n/g, '\r');
+      }
 
-            return { success: true, result };
-        },
+      return { success: true, result };
+    },
 
-        getDebugInfo: () => ({
-            crlfCount,
-            lfCount,
-            crCount,
-            chosen: lineEnding === '\r\n' ? 'CRLF' : (lineEnding === '\r' ? 'CR' : 'LF'),
-            totalSize: content.length
-        }),
+    getDebugInfo: () => ({
+      crlfCount,
+      lfCount,
+      crCount,
+      chosen: lineEnding === '\r\n' ? 'CRLF' : (lineEnding === '\r' ? 'CR' : 'LF'),
+      totalSize: content.length
+    }),
 
-        hasCRLF,
-        lineEnding: JSON.stringify(lineEnding)
-    };
+    hasCRLF,
+    lineEnding: JSON.stringify(lineEnding)
+  };
 }
 
 function getUniqueFilePath(filePath) {
@@ -193,6 +217,36 @@ function getUniqueFilePath(filePath) {
     }
     counter++;
   }
+}
+
+/**
+ * Detect file encoding from raw buffer.
+ * Progressive: BOM detection (zero-dep) → chardet (if installed) → fallback utf-8.
+ */
+function detectEncoding(buffer) {
+  // 1. BOM detection (zero dependency)
+  if (buffer.length >= 3 && buffer[0] === 0xEF && buffer[1] === 0xBB && buffer[2] === 0xBF) {
+    return { encoding: 'utf-8', bom: true, confidence: 'bom' };
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xFF && buffer[1] === 0xFE) {
+    return { encoding: 'utf-16le', bom: true, confidence: 'bom' };
+  }
+  if (buffer.length >= 2 && buffer[0] === 0xFE && buffer[1] === 0xFF) {
+    return { encoding: 'utf-16be', bom: true, confidence: 'bom' };
+  }
+
+  // 2. Try chardet if available (progressive upgrade)
+  try {
+    const chardet = require('chardet');
+    const sample = buffer.slice(0, 4096);
+    const detected = chardet.detect(sample);
+    return { encoding: detected || 'utf-8', bom: false, confidence: 'chardet' };
+  } catch (_e) {
+    // chardet not installed — fallback
+  }
+
+  // 3. Fallback: assume utf-8
+  return { encoding: 'utf-8', bom: false, confidence: 'fallback' };
 }
 
 function applyDiffLogic(originalContent, diffContent) {
@@ -539,6 +593,10 @@ async function readFile(filePath, encoding = 'utf8', lines) {
       };
     }
 
+    // Detect encoding for text files (non-extracted, non-binary)
+    const isDataUriCheck = typeof content === 'string' && content.startsWith('data:');
+    const encodingInfo = (!isExtracted && !isDataUriCheck) ? detectEncoding(fileBuffer) : null;
+
     const returnData = {
       size: stats.size,
       sizeFormatted: formatFileSize(stats.size),
@@ -546,7 +604,8 @@ async function readFile(filePath, encoding = 'utf8', lines) {
       encoding: isExtracted ? 'utf8' : encoding,
       isExtracted: isExtracted,
       fileName: path.basename(filePath),
-      lines: lineSelectionMetadata
+      lines: lineSelectionMetadata,
+      detectedEncoding: encodingInfo
     };
 
     const lineInfoText = lineSelectionMetadata && !lineSelectionMetadata.skipped
@@ -565,19 +624,11 @@ async function readFile(filePath, encoding = 'utf8', lines) {
         { type: 'image_url', image_url: { url: content } }
       ];
     } else {
-      // For text-based files
-      let language = extension.slice(1).toLowerCase();
-      const codeLangs = {
-        'js': 'javascript', 'py': 'python', 'md': 'markdown', 'ts': 'typescript',
-        'html': 'html', 'css': 'css', 'json': 'json', 'sh': 'bash', 'yml': 'yaml', 'yaml': 'yaml'
-      };
-      language = codeLangs[language] || language;
-      if (isExtracted) language = '';
-
-      const backticks = content.includes('```') ? '````' : '```';
-
+      // For text-based files — return header and raw content as separate objects
+      // (no code block wrapping, to avoid interfering with ApplyDiff target matching)
       returnData.content = [
-        { type: 'text', text: `${headerText}\n${backticks}${language}\n${content}\n${backticks}` }
+        { type: 'text', text: headerText },
+        { type: 'text', text: content }
       ];
     }
 
@@ -685,7 +736,17 @@ async function appendFile(filePath, content, encoding = 'utf8') {
       throw new Error(`File would be too large after append: exceeds limit of ${formatFileSize(MAX_FILE_SIZE)}`);
     }
 
-    await fs.appendFile(filePath, content, encoding);
+    // Preserve original file's line ending style when appending
+    let finalContent = content;
+    try {
+      const existingContent = await fs.readFile(filePath, encoding);
+      const helper = createLineEndingHelper(existingContent);
+      finalContent = helper.denormalize(helper.normalize(content));
+    } catch (_e) {
+      // File doesn't exist yet, keep content as-is (LF from AI)
+    }
+
+    await fs.appendFile(filePath, finalContent, encoding);
     const stats = await fs.stat(filePath);
 
     let result = {
@@ -720,11 +781,14 @@ async function editFile(filePath, content, encoding = 'utf8') {
     }
 
     // Ensure the file exists before attempting to edit it.
+    let originalContent = null;
     try {
       const stats = await fs.stat(filePath);
       if (stats.isDirectory()) {
         throw new Error(`Path points to a directory, not a file. Cannot edit.`);
       }
+      // Read original content to detect line endings
+      originalContent = await fs.readFile(filePath, encoding);
     } catch (e) {
       if (e.code === 'ENOENT') {
         throw new Error(`File not found at '${filePath}'. Use WriteFile to create a new file.`);
@@ -736,7 +800,14 @@ async function editFile(filePath, content, encoding = 'utf8') {
       throw new Error(`Content too large: exceeds limit of ${formatFileSize(MAX_FILE_SIZE)}`);
     }
 
-    await fs.writeFile(filePath, content, encoding);
+    // Preserve original file's line ending style
+    let finalContent = content;
+    if (originalContent) {
+      const helper = createLineEndingHelper(originalContent);
+      finalContent = helper.denormalize(helper.normalize(content));
+    }
+
+    await fs.writeFile(filePath, finalContent, encoding);
     const stats = await fs.stat(filePath);
 
     let result = {
@@ -1374,10 +1445,10 @@ async function createCanvas(fileName, content, encoding = 'utf8') {
   }
 }
 
-async function updateHistory(filePath, searchString, replaceString, encoding = 'utf8') {
+async function updateHistory(filePath, target, replace, encoding = 'utf8') {
   try {
     filePath = resolveAndNormalizePath(filePath);
-    debugLog('Updating history file', { filePath, searchString, replaceString });
+    debugLog('Updating history file', { filePath, target, replace });
 
     if (!isPathAllowed(filePath, 'UpdateHistory')) {
       throw new Error(`Access denied: Path '${filePath}' is not in allowed directories`);
@@ -1407,9 +1478,9 @@ async function updateHistory(filePath, searchString, replaceString, encoding = '
       const entry = history[i];
       if (entry.role === 'assistant' && typeof entry.content === 'string') {
         // [CRLF Fix] Use normalized comparison
-        if (helper.includes(entry.content, searchString)) {
+        if (helper.includes(entry.content, target)) {
           // [CRLF Fix] Use safe replacement
-          const replaceResult = helper.safeReplace(entry.content, searchString, replaceString);
+          const replaceResult = helper.safeReplace(entry.content, target, replace);
           if (replaceResult.success) {
             entry.content = replaceResult.result;
             updateApplied = true;
@@ -1421,7 +1492,7 @@ async function updateHistory(filePath, searchString, replaceString, encoding = '
     }
 
     if (!updateApplied) {
-      throw new Error(`Content to replace was not found in any assistant message. Search string: "${searchString}"`);
+      throw new Error(`Content to replace was not found in any assistant message. Target: "${target}"`);
     }
 
     // 4. Stringify the modified history and write it back
@@ -1447,14 +1518,23 @@ async function updateHistory(filePath, searchString, replaceString, encoding = '
   }
 }
 
+function getTargetReplaceParameters(parameters) {
+  return {
+    // 新字段优先；旧字段保留兼容，避免已有 Agent 提示词和批量调用迁移失败。
+    target: getParameterValue(parameters, 'target', 'searchString'),
+    replace: getParameterValue(parameters, 'replace', 'replaceString')
+  };
+}
+
 async function applyDiff(parameters) {
   try {
-    const { diffContent, searchString, replaceString, encoding = 'utf8' } = parameters;
+    const { diffContent, encoding = 'utf8' } = parameters;
+    const { target, replace } = getTargetReplaceParameters(parameters);
     const filePath = getPathParameter(parameters, 'filePath');
 
     // [FIX] Resolve path and read raw content directly via fs.readFile(),
     // bypassing readFile()'s display formatting (code block wrapping)
-    // that was causing searchString match failures.
+    // that was causing target match failures.
     const resolvedPath = resolveAndNormalizePath(filePath);
 
     if (!isPathAllowed(resolvedPath, 'ApplyDiff')) {
@@ -1488,13 +1568,17 @@ async function applyDiff(parameters) {
 
       newContent = helper.denormalize(normResult);
 
-    } else if (searchString !== undefined && replaceString !== undefined) {
-      const replaceResult = helper.safeReplace(originalContent, searchString, replaceString);
+    } else if (target !== undefined && replace !== undefined) {
+      if (typeof target !== 'string' || typeof replace !== 'string') {
+        throw new Error('ApplyDiff "target" and "replace" parameters must be strings.');
+      }
+
+      const replaceResult = helper.safeReplace(originalContent, target, replace);
 
       if (!replaceResult.success) {
         throw new Error(
-          `Diff application failed: searchString not found after CRLF normalization. ` +
-          `Search: "${searchString.substring(0, 80)}..."`
+          `Diff application failed: target not found after CRLF normalization. ` +
+          `Target: "${target.substring(0, 80)}..."`
         );
       }
 
@@ -1505,7 +1589,10 @@ async function applyDiff(parameters) {
       });
 
     } else {
-      throw new Error('ApplyDiff requires either "diffContent" or both "searchString" and "replaceString" parameters.');
+      throw new Error(
+        'ApplyDiff requires either "diffContent" or both "target" and "replace" parameters. ' +
+        'Legacy "searchString"/"replaceString" parameters remain supported.'
+      );
     }
 
     const editResult = await editFile(filePath, newContent, encoding);
@@ -1590,13 +1677,13 @@ async function processBatchRequest(request) {
           }
           break;
         case 'CopyFile':
-          result = await copyFile(getPathParameter(parameters, 'sourcePath'), getPathParameter(parameters, 'destinationPath'));
+          result = await copyFile(getSourcePathParameter(parameters), getDestinationPathParameter(parameters));
           break;
         case 'MoveFile':
-          result = await moveFile(getPathParameter(parameters, 'sourcePath'), getPathParameter(parameters, 'destinationPath'));
+          result = await moveFile(getSourcePathParameter(parameters), getDestinationPathParameter(parameters));
           break;
         case 'RenameFile':
-          result = await renameFile(getPathParameter(parameters, 'sourcePath'), getPathParameter(parameters, 'destinationPath'));
+          result = await renameFile(getSourcePathParameter(parameters), getDestinationPathParameter(parameters));
           break;
         case 'DeleteFile':
           result = await deleteFile(getPathParameter(parameters, 'filePath'));
@@ -1622,9 +1709,11 @@ async function processBatchRequest(request) {
         case 'CreateCanvas':
           result = await createCanvas(parameters.fileName, parameters.content, parameters.encoding);
           break;
-        case 'UpdateHistory':
-          result = await updateHistory(getPathParameter(parameters, 'filePath'), parameters.searchString, parameters.replaceString, parameters.encoding);
+        case 'UpdateHistory': {
+          const { target, replace } = getTargetReplaceParameters(parameters);
+          result = await updateHistory(getPathParameter(parameters, 'filePath'), target, replace, parameters.encoding);
           break;
+        }
         case 'ApplyDiff':
           result = await applyDiff(parameters);
           break;
@@ -1717,11 +1806,11 @@ async function processRequest(request) {
     case 'FileInfo':
       return await getFileInfo(getPathParameter(parameters, 'filePath'));
     case 'CopyFile':
-      return await copyFile(getPathParameter(parameters, 'sourcePath'), getPathParameter(parameters, 'destinationPath'));
+      return await copyFile(getSourcePathParameter(parameters), getDestinationPathParameter(parameters));
     case 'MoveFile':
-      return await moveFile(getPathParameter(parameters, 'sourcePath'), getPathParameter(parameters, 'destinationPath'));
+      return await moveFile(getSourcePathParameter(parameters), getDestinationPathParameter(parameters));
     case 'RenameFile':
-      return await renameFile(getPathParameter(parameters, 'sourcePath'), getPathParameter(parameters, 'destinationPath'));
+      return await renameFile(getSourcePathParameter(parameters), getDestinationPathParameter(parameters));
     case 'DeleteFile':
       return await deleteFile(getPathParameter(parameters, 'filePath'));
     case 'CreateDirectory':
@@ -1732,8 +1821,10 @@ async function processRequest(request) {
       return await downloadFile(parameters.url, parameters.downloadDir, parameters.fileName);
     case 'CreateCanvas':
       return await createCanvas(parameters.fileName, parameters.content, parameters.encoding);
-    case 'UpdateHistory':
-      return await updateHistory(getPathParameter(parameters, 'filePath'), parameters.searchString, parameters.replaceString, parameters.encoding);
+    case 'UpdateHistory': {
+      const { target, replace } = getTargetReplaceParameters(parameters);
+      return await updateHistory(getPathParameter(parameters, 'filePath'), target, replace, parameters.encoding);
+    }
     case 'ApplyDiff':
       return await applyDiff(parameters);
     default:
