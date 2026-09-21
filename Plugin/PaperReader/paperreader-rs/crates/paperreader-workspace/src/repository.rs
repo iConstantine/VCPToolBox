@@ -1,6 +1,48 @@
 use crate::prelude::*;
 use crate::*;
 
+/// 原子写入：先写同目录临时文件，再 rename 替换目标文件。
+/// 多进程并发场景（async worker 写工件 + 轮询进程读工件）下，
+/// 避免 reader 在 truncate 与 write 之间读到空文件导致 serde EOF。
+fn atomic_write(path: &Path, contents: &str) -> anyhow::Result<()> {
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    std::fs::create_dir_all(&directory)?;
+    let file_name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "artifact".to_string());
+    let unique_suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temp_path = directory.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        unique_suffix
+    ));
+    let write_result =
+        std::fs::write(&temp_path, contents).and_then(|()| std::fs::rename(&temp_path, path));
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// 判断是否为 atomic_write 的瞬时临时文件（工件遍历时跳过）
+fn is_transient_temp_file(path: &Path) -> bool {
+    path.file_name()
+        .map(|value| {
+            let name = value.to_string_lossy();
+            name.starts_with('.') && name.ends_with(".tmp")
+        })
+        .unwrap_or(false)
+}
+
 // =============================================================================
 // Workspace Repository
 // =============================================================================
@@ -72,7 +114,7 @@ impl WorkspaceRepository {
         } else {
             serde_json::to_string_pretty(value)?
         };
-        std::fs::write(path, json)?;
+        atomic_write(path, &json)?;
         Ok(())
     }
 
@@ -80,7 +122,7 @@ impl WorkspaceRepository {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, value)?;
+        atomic_write(path, value)?;
         self.write_text_artifact_sidecar(path, "text/markdown")?;
         Ok(())
     }
@@ -209,6 +251,9 @@ impl WorkspaceRepository {
         let mut stack = vec![canonical_prefix];
         let mut artifacts = Vec::new();
         while let Some(path) = stack.pop() {
+            if is_transient_temp_file(&path) {
+                continue;
+            }
             if path.is_dir() {
                 for entry in std::fs::read_dir(&path)? {
                     stack.push(entry?.path());
@@ -286,7 +331,7 @@ impl WorkspaceRepository {
             },
         );
         let json = serde_json::to_string_pretty(&artifact)?;
-        std::fs::write(sidecar_path, json)?;
+        atomic_write(&sidecar_path, &json)?;
         Ok(())
     }
 

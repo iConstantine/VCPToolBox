@@ -339,3 +339,5 @@ Plugin/VCPBridgeServer/weimingsnow.txt
 # ==== 开发SDK ====
 Plugin/VCPQQBotServer/bot-node-sdk-main
 开发日志/
+Plugin/PaperReader/workspace-rs/
+
