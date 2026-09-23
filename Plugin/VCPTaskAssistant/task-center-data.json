@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "globalEnabled": false,
+  "globalEnabled": true,
   "settings": {
     "maxHistory": 200
   },

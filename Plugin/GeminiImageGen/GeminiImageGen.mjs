@@ -16,7 +16,9 @@ const {
     PROJECT_BASE_PATH,
     SERVER_PORT,
     IMAGESERVER_IMAGE_KEY,
-    VAR_HTTP_URL
+    VAR_HTTP_URL,
+    API_BASE_URL,
+    GEMINI_MODEL
 } = (() => {
     const keys = (process.env.GeminiImageKey || '').split(',').map(k => k.trim()).filter(Boolean);
     if (keys.length === 0) {
@@ -30,6 +32,8 @@ const {
     }
 
     const distServers = (process.env.DIST_IMAGE_SERVERS || '').split(',').map(s => s.trim()).filter(Boolean);
+    const baseUrl = (process.env.GeminiImageApiUrl || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');
+    const model = (process.env.GeminiImageModel || 'gemini-2.5-flash-image').trim();
 
     return {
         GEMINI_API_KEYS: keys,
@@ -38,12 +42,16 @@ const {
         PROJECT_BASE_PATH: process.env.PROJECT_BASE_PATH,
         SERVER_PORT: process.env.SERVER_PORT,
         IMAGESERVER_IMAGE_KEY: process.env.IMAGESERVER_IMAGE_KEY,
-        VAR_HTTP_URL: process.env.VarHttpUrl
+        VAR_HTTP_URL: process.env.VarHttpUrl,
+        API_BASE_URL: baseUrl,
+        GEMINI_MODEL: model
     };
 })();
 
-const API_BASE_URL = 'https://generativelanguage.googleapis.com';
-const API_ENDPOINT_GENERATE = '/v1beta/models/gemini-2.5-flash-image-preview:generateContent'; // 使用 flash 预览模型
+function getEndpointForModel(modelName) {
+    const m = modelName || GEMINI_MODEL;
+    return `/v1beta/models/${m}:generateContent`;
+}
 
 function getRandomApiKey() {
     if (GEMINI_API_KEYS.length === 0) {
@@ -227,7 +235,9 @@ async function generateImage(args) {
         "generationConfig": { "responseModalities": ["TEXT", "IMAGE"] }
     };
 
-    const parts = await callGeminiApi(API_ENDPOINT_GENERATE, payload);
+    const modelName = args.model || GEMINI_MODEL;
+    const endpoint = getEndpointForModel(modelName);
+    const parts = await callGeminiApi(endpoint, payload);
     return await processApiResponseAndSaveImage(parts, args);
 }
 
@@ -289,7 +299,9 @@ async function editImage(args) {
         "generationConfig": { "responseModalities": ["TEXT", "IMAGE"] }
     };
 
-    const parts = await callGeminiApi(API_ENDPOINT_GENERATE, payload);
+    const modelName = args.model || GEMINI_MODEL;
+    const endpoint = getEndpointForModel(modelName);
+    const parts = await callGeminiApi(endpoint, payload);
     return await processApiResponseAndSaveImage(parts, args);
 }
 

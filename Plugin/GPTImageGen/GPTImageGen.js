@@ -25,7 +25,7 @@ import { URL } from 'url';
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_BASE_URL = (process.env.OPENAI_BASE_URL || 'https://api.openai.com').replace(/\/+$/, '');
-const GPT_IMAGE_MODEL = process.env.GPT_IMAGE_MODEL || 'gpt-image-2';
+const GPT_IMAGE_MODEL = process.env.GPT_IMAGE_MODEL || 'gpt-image-2-all';
 const DEFAULT_SIZE = process.env.DEFAULT_SIZE || '1024x1024';
 const DEFAULT_QUALITY = process.env.DEFAULT_QUALITY || 'auto';
 const DEFAULT_RESPONSE_FORMAT = process.env.DEFAULT_RESPONSE_FORMAT || 'url';

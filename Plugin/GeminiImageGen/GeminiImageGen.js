@@ -15,7 +15,9 @@ const {
     PROJECT_BASE_PATH,
     SERVER_PORT,
     IMAGESERVER_IMAGE_KEY,
-    VAR_HTTP_URL
+    VAR_HTTP_URL,
+    API_BASE_URL,
+    GEMINI_MODEL
 } = (() => {
     const keys = (process.env.GeminiImageKey || '').split(',').map(k => k.trim()).filter(Boolean);
     if (keys.length === 0) {
@@ -28,18 +30,25 @@ const {
         console.log(`[GeminiImageGen] 使用代理: ${proxyUrl}`);
     }
 
+    const baseUrl = (process.env.GeminiImageApiUrl || 'http://localhost:3000').replace(/\/+$/, '');
+    const model = (process.env.GeminiImageModel || 'gemini-2.5-flash-image').trim();
+
     return {
         GEMINI_API_KEYS: keys,
         PROXY_AGENT: agent,
         PROJECT_BASE_PATH: process.env.PROJECT_BASE_PATH,
         SERVER_PORT: process.env.SERVER_PORT,
         IMAGESERVER_IMAGE_KEY: process.env.IMAGESERVER_IMAGE_KEY,
-        VAR_HTTP_URL: process.env.VarHttpUrl
+        VAR_HTTP_URL: process.env.VarHttpUrl,
+        API_BASE_URL: baseUrl,
+        GEMINI_MODEL: model
     };
 })();
 
-const API_BASE_URL = 'https://generativelanguage.googleapis.com';
-const API_ENDPOINT = '/v1beta/models/gemini-2.0-flash-preview-image-generation:generateContent';
+function getEndpointForModel(modelName) {
+    const m = modelName || GEMINI_MODEL;
+    return `/v1beta/models/${m}:generateContent`;
+}
 
 function getRandomApiKey() {
     if (GEMINI_API_KEYS.length === 0) {
@@ -82,9 +91,9 @@ async function getImageDataFromUrl(url) {
  * @param {object} payload - 发送给 API 的请求体
  * @returns {Promise<Array<object>>} - 包含 text 和 inline_data 的 parts 数组
  */
-async function callGeminiApi(payload) {
+async function callGeminiApi(endpoint, payload) {
     const apiKey = getRandomApiKey();
-    const fullApiUrl = `${API_BASE_URL}${API_ENDPOINT}?key=${apiKey}`;
+    const fullApiUrl = `${API_BASE_URL}${endpoint}?key=${apiKey}`;
 
     const response = await axios.post(fullApiUrl, payload, {
         headers: { 'Content-Type': 'application/json' },
@@ -178,7 +187,9 @@ async function generateImage(args) {
         "generationConfig": { "responseModalities": ["TEXT", "IMAGE"] }
     };
 
-    const parts = await callGeminiApi(payload);
+    const modelName = args.model || GEMINI_MODEL;
+    const endpoint = getEndpointForModel(modelName);
+    const parts = await callGeminiApi(endpoint, payload);
     return await processApiResponseAndSaveImage(parts, args);
 }
 
@@ -203,7 +214,9 @@ async function editImage(args) {
         "generationConfig": { "responseModalities": ["TEXT", "IMAGE"] }
     };
 
-    const parts = await callGeminiApi(payload);
+    const modelName = args.model || GEMINI_MODEL;
+    const endpoint = getEndpointForModel(modelName);
+    const parts = await callGeminiApi(endpoint, payload);
     return await processApiResponseAndSaveImage(parts, args);
 }
 
