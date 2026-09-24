@@ -6,6 +6,7 @@ const { pathToFileURL } = require('url');
 const { getEmbeddingsBatch, cosineSimilarity } = require('../../EmbeddingUtils');
 const toolCallRecordStore = require('../toolCallRecordStore');
 const jevRiverReranker = require('../jevRiverReranker'); // river semantic:N 的级联第二阶段
+const jevToolCallExp = require('../jevToolCallExp');
 
 const VCP_TIMED_CONTACTS_DIR = path.join(__dirname, '..', '..', 'VCPTimedContacts');
 
@@ -192,6 +193,40 @@ class ToolExecutor {
    */
   async execute(toolCall, clientIp, contextMessages = []) {
     const { name, args, river, vref, archeryNoReply } = toolCall;
+
+    // === JEV 实验性虚拟工具展开 ===
+    // JEV 本身不是插件。规划器仅生成白名单真实工具调用，随后递归进入
+    // 本执行链，使验证码、人工审核、工具记录、隐私过滤与分布式桥保持生效。
+    if (jevToolCallExp.isVirtualToolName(name)) {
+      try {
+        // 传入完整虚拟调用，使规划器在展开后保留通用调用协议：
+        // timely_contact/tool_password 参数及 archery/ink/river/vref 元数据。
+        const expandedCalls = await jevToolCallExp.plan(args?.expression, toolCall);
+        if (expandedCalls.length === 0) {
+          return this._createErrorResult(name, 'JEV 没有生成可执行的真实工具调用。');
+        }
+
+        const expandedResults = await this.executeAll(expandedCalls, clientIp, contextMessages);
+        if (expandedResults.length === 1) return expandedResults[0];
+
+        const successful = expandedResults.filter(result => result?.success);
+        return {
+          success: successful.length === expandedResults.length,
+          content: expandedResults.flatMap(result => Array.isArray(result?.content) ? result.content : []),
+          raw: {
+            status: successful.length === expandedResults.length ? 'success' : 'partial',
+            virtualTool: 'JEV',
+            expandedTools: expandedCalls.map(call => call.name),
+            results: expandedResults.map(result => result?.raw ?? {
+              success: result?.success,
+              error: result?.error
+            })
+          }
+        };
+      } catch (error) {
+        return this._createErrorResult(name, `JEV 规划错误: ${error.message}`);
+      }
+    }
 
     // === river 上下文注入 ===
     // river 协议允许 AI 在工具调用时携带对话上下文，支持四种模式：
