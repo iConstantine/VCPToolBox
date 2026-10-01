@@ -3,3 +3,14 @@
 
 # Keep this ignore policy tracked.
 !.gitignore
+
+# 排除项目自带且已追踪的 Agent 配置文件
+!Aemeath.txt
+!DreamNova.txt
+!Hornet.txt
+!Kerr.txt
+!MemoMaster.txt
+!Metis.txt
+!Nova.txt
+!ThemeMaidCoco.txt
+!Weiming.txt
